@@ -61,19 +61,35 @@ class SimSiam(nn.Module):
 
         return p1, p2, z1.detach(), z2.detach()
 
-class ProposedModel(SimSiam):
+class MultiGroup(SimSiam):
 
-    def __init__(self, *args, **kwargs):
-        super(ProposedModel, self).__init__(*args, **kwargs)
-        self.n_classes = kwargs.get("n_classes", 2048)
-        self.clusters = nn.Linear(self.dim, self.n_classes)
-
+    def __init__(self, group_sizes, group_nums, *args, **kwargs):
+        super(MultiGroup, self).__init__(*args, **kwargs)
+        self.group_sizes = group_sizes
+        self.group_nums = group_nums
+        i = 0
+        self.groups = []
+        for gs, gn in zip(group_sizes, group_nums):
+            same_sized_groups = []
+            for _ in range(gn):
+                group = nn.Linear(self.dim, gs)
+                setattr(self, f"group_{gs}_{i}", group)
+                i += 1
+                same_sized_groups.append(group)
+            self.groups.append(same_sized_groups)
 
     def forward(self, x1, x2):
-        p1, p2, z1, z2 = super(ProposedModel, self).forward(x1, x2)
-        p1 = self.clusters(p1)
-        p2 = self.clusters(p2)
-        z1 = self.clusters(z1)
-        z2 = self.clusters(z2)
-
-        return p1, p2, z1.detach(), z2.detach()
+        p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
+        p1s, p2s, z1s, z2s = [], [], [], []
+        for same_sized_groups in self.groups:
+            ss_p1s, ss_p2s, ss_z1s, ss_z2s = [], [], [], []
+            for group in same_sized_groups:
+                ss_p1s.append(group(p1))
+                ss_p2s.append(group(p2))
+                ss_z1s.append(group(z1).detach())
+                ss_z2s.append(group(z2).detach())
+            p1s.append(ss_p1s)
+            p2s.append(ss_p2s)
+            z1s.append(ss_z1s)
+            z2s.append(ss_z2s)
+        return p1s, p2s, z1s, z2s
