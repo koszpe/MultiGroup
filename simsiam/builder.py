@@ -7,7 +7,6 @@
 import torch
 import torch.nn as nn
 
-
 class SimSiam(nn.Module):
     """
     Build a SimSiam model.
@@ -18,6 +17,8 @@ class SimSiam(nn.Module):
         pred_dim: hidden dimension of the predictor (default: 512)
         """
         super(SimSiam, self).__init__()
+        self.dim = dim
+        self.pred_dim = pred_dim
 
         # create the encoder
         # num_classes is the output fc dimension, zero-initialize last BNs
@@ -57,5 +58,22 @@ class SimSiam(nn.Module):
 
         p1 = self.predictor(z1) # NxC
         p2 = self.predictor(z2) # NxC
+
+        return p1, p2, z1.detach(), z2.detach()
+
+class ProposedModel(SimSiam):
+
+    def __init__(self, *args, **kwargs):
+        super(ProposedModel, self).__init__(*args, **kwargs)
+        self.n_classes = kwargs.get("n_classes", 2048)
+        self.clusters = nn.Linear(self.dim, self.n_classes)
+
+
+    def forward(self, x1, x2):
+        p1, p2, z1, z2 = super(ProposedModel, self).forward(x1, x2)
+        p1 = self.clusters(p1)
+        p2 = self.clusters(p2)
+        z1 = self.clusters(z1)
+        z2 = self.clusters(z2)
 
         return p1, p2, z1.detach(), z2.detach()
