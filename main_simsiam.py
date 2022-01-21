@@ -29,14 +29,16 @@ import torchvision.models as models
 
 import simsiam.loader
 import simsiam.builder
+from simsiam.logger import TBLogger
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
-                    help='path to dataset')
+parser.add_argument("runname", help="Name of run on tensorboard")
+parser.add_argument('--data', metavar='DIR',
+                    help='path to dataset', default='/data/shared/data/imagenet')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
@@ -48,7 +50,7 @@ parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=512, type=int,
+parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N',
                     help='mini-batch size (default: 512), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -64,11 +66,11 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
-parser.add_argument('--world-size', default=-1, type=int,
+parser.add_argument('--world-size', default=1, type=int,
                     help='number of nodes for distributed training')
-parser.add_argument('--rank', default=-1, type=int,
+parser.add_argument('--rank', default=0, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+parser.add_argument('--dist-url', default='tcp://localhost:10001', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -76,7 +78,8 @@ parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
-parser.add_argument('--multiprocessing-distributed', action='store_true',
+parser.add_argument('--no-multiprocessing-distributed', action='store_false',
+                    dest="multiprocessing_distributed",
                     help='Use multi-processing distributed training to launch '
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
@@ -87,8 +90,13 @@ parser.add_argument('--dim', default=2048, type=int,
                     help='feature dimension (default: 2048)')
 parser.add_argument('--pred-dim', default=512, type=int,
                     help='hidden dimension of the predictor (default: 512)')
-parser.add_argument('--fix-pred-lr', action='store_true',
+parser.add_argument('--no-fix-pred-lr', action='store_false', dest="fix_pred_lr",
                     help='Fix learning rate for the predictor')
+
+parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
+                    help='Where to log')
+parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
+parser.add_argument("--ls-crop", action="store_true", help="Large - Small crop training")
 
 def main():
     args = parser.parse_args()
@@ -251,25 +259,34 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
+    global_step = len(train_loader) * args.start_epoch
+    folder = os.path.join(args.logdir, args.runname)
+    os.makedirs(folder, exist_ok=True)
+    tb_logger = TBLogger(log_dir=folder,
+                         global_step=global_step,
+                         batch_size=args.batch_size,
+                         world_size=args.world_size)
+
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, tb_logger, args)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
+        if (epoch+1) % args.save_frequency == 0:
+            filename = os.path.join(folder, 'checkpoint_{:04d}.pt'.format(epoch+1))
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+            }, is_best=False, filename=filename)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4f')
@@ -307,6 +324,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+
+        tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
+        tb_logger.step()
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
