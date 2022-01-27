@@ -70,15 +70,15 @@ parser.add_argument('--world-size', default=1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=0, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://localhost:10001', type=str,
+parser.add_argument('--dist-url', default='env://', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
-parser.add_argument('--gpu', default=None, type=int,
+parser.add_argument('--gpu', default=0, type=int,
                     help='GPU id to use.')
-parser.add_argument('--no-multiprocessing-distributed', action='store_false',
+parser.add_argument('--multiprocessing-distributed', action='store_true',
                     dest="multiprocessing_distributed",
                     help='Use multi-processing distributed training to launch '
                          'N processes per node, which has N GPUs. This is the '
@@ -97,8 +97,8 @@ parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
-parser.add_argument("--group_sizes", default=[2, 16, 64, 128], help="Size of the groups to create")
-parser.add_argument("--group_nums", default= [4, 4,  4,  4], help="Num of the grous")
+parser.add_argument("--group-sizes", default=[2, 16, 64, 128], help="Size of the groups to create")
+parser.add_argument("--group-nums", default= [4, 4,  4,  4], help="Num of the grous")
 
 def main():
     args = parser.parse_args()
@@ -192,7 +192,7 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
         # comment out the following line for debugging
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        # raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
         # AllGather implementation (batch shuffle, queue update, etc.) in
         # this code only supports DistributedDataParallel.
@@ -201,7 +201,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # define loss function (criterion) and optimizer
     # criterion = nn.CosineSimilarity(dim=1).cuda(args.gpu)
-    criterion = crossentropy()  # nn.CrossEntropyLoss()
+    criterion = crossentropy  # nn.CrossEntropyLoss()
 
     if args.fix_pred_lr:
         optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
@@ -279,7 +279,8 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, tb_logger, args)
+        with torch.autograd.set_detect_anomaly(True):
+            train(train_loader, model, criterion, optimizer, epoch, tb_logger, args)
 
         if (epoch + 1) % args.save_frequency == 0 or epoch == 0:
             filename = os.path.join(folder, 'checkpoint_{:04d}.pt'.format(epoch+1))
@@ -296,20 +297,73 @@ def sharpen(p, T=0.25):
     sharp_p /= torch.sum(sharp_p, dim=1, keepdim=True)
     return sharp_p
 
-def crossentropy():
-    softmax = torch.nn.Softmax(dim=1)
-    def loss(ps, qs):
-        for ss_ps, ss_qs in zip(ps, qs):
-            ss_loss = 0
-            for p, q in enumerate(zip(ss_ps, ss_qs)):
-                p = softmax(p)
-                p[p<1-4] = 0
-                p = sharpen(p)
-                q = softmax(q)
-                ss_loss -= torch.sum(p * torch.log(q+1e-6)) / len(p)
-        return
-    return loss
+sm = torch.nn.Softmax(dim=1)
+def softmax(x):
+    return sm(x - x.max(dim=1, keepdim=True)[0])
 
+def crossentropy(ps, qs):
+    loss_count = 0
+    sum_loss = 0
+    for ss_ps, ss_qs in zip(ps, qs):
+        for p, q in zip(ss_ps, ss_qs):
+            p = softmax(p)
+            # p[p<1-4] = 0
+            # p = sharpen(p)
+            q = softmax(q)
+            sum_loss -= torch.sum(p * torch.log(q+1e-6)) / len(p)
+            loss_count += 1
+    return sum_loss / loss_count
+
+def me_max(qs):
+    loss_count = 0
+    sum_loss = 0
+    for ss_qs in qs:
+        for q in ss_qs:
+            # avg_probs = torch.mean(sharpen(softmax(q)), dim=0)
+            avg_probs = torch.mean(softmax(q), dim=0)
+            if (
+                    dist.is_available()
+                    and dist.is_initialized()
+                    and (dist.get_world_size() > 1)
+            ):
+                avg_probs = avg_probs.contiguous() / dist.get_world_size()
+                dist.all_reduce(avg_probs)
+            # sum_loss -= torch.sum(torch.log(avg_probs ** (-avg_probs)  + 1e-6))
+            sum_loss -= torch.sum(-avg_probs * torch.log(avg_probs + 1e-6))
+            loss_count += 1
+    return sum_loss / loss_count
+
+def correlation(qs, apply_softmax=True, corr=True):
+    loss_count = 0
+    sum_loss = 0
+    for ss_qs in qs:
+        if (
+                dist.is_available()
+                and dist.is_initialized()
+                and (dist.get_world_size() > 1)
+        ):
+            gathered_ss_qs = []
+            for q in ss_qs:
+                    gathered_q = [torch.zeros_like(q) for _ in range(dist.get_world_size())]
+                    dist.all_gather(gathered_q, q)
+                    gathered_ss_qs.append(torch.cat(gathered_q, 0))
+        else:
+            gathered_ss_qs = ss_qs
+        for i in range(len(gathered_ss_qs)):
+            for j in range(i + 1, len(gathered_ss_qs)):
+                q1, q2 = gathered_ss_qs[i], gathered_ss_qs[j]
+                if apply_softmax:
+                    q1, q2 = softmax(q1), softmax(q2)
+                normed_q1 = (q1 - q1.mean(dim=0))
+                normed_q2 = (q2 - q2.mean(dim=0))
+                if corr:
+                    normed_q1 /= q1.std()
+                    normed_q2 /= q2.std()
+                corr_m = (normed_q1.T @ normed_q2) / (q1.shape[0] - 1)
+                sum_loss += corr_m.abs().mean()
+
+                loss_count += 1
+    return sum_loss / loss_count
 
 def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -334,8 +388,15 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
 
         # compute output and loss
         p1s, p2s, z1s, z2s = model(x1=images[0], x2=images[1])
-        loss = -(criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
+        ce = (criterion(p1s, z2s).mean() + criterion(p2s, z1s).mean()) * 0.5
+        memax = (me_max(p1s) + me_max(p2s)) * 0.5
+        # div = (diversity(p1s) + diversity(p2s)) * 0.5
+        cov_w_s = (correlation(p1s, apply_softmax=True, corr=False) + correlation(p2s, apply_softmax=True, corr=False)) * 0.5
+        cov_wo_s = (correlation(p1s, apply_softmax=False, corr=False) + correlation(p2s, apply_softmax=False, corr=False)) * 0.5
+        corr_w_s = (correlation(p1s, apply_softmax=True, corr=True) + correlation(p2s, apply_softmax=True, corr=True)) * 0.5
+        corr_wo_s = (correlation(p1s, apply_softmax=False, corr=True) + correlation(p2s, apply_softmax=False, corr=True)) * 0.5
 
+        loss = -ce + memax + corr_wo_s
         losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
@@ -351,6 +412,12 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
             progress.display(i)
 
         tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
+        tb_logger.add_scalar(tag="train/ce", scalar_value=ce.item())
+        tb_logger.add_scalar(tag="train/memax", scalar_value=memax.item())
+        tb_logger.add_scalar(tag="train/covariance_w_softmax", scalar_value=cov_w_s.item())
+        tb_logger.add_scalar(tag="train/covariance_wo_softmax", scalar_value=cov_wo_s.item())
+        tb_logger.add_scalar(tag="train/corr_w_softmax", scalar_value=corr_w_s.item())
+        tb_logger.add_scalar(tag="train/corr_wo_softmax", scalar_value=corr_wo_s.item())
         tb_logger.step()
 
 

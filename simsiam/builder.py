@@ -78,18 +78,31 @@ class MultiGroup(SimSiam):
                 same_sized_groups.append(group)
             self.groups.append(same_sized_groups)
 
+    # def forward(self, x1, x2):
+    #     p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
+    #     p1s, p2s, z1s, z2s = [], [], [], []
+    #     for same_sized_groups in self.groups:
+    #         ss_p1s, ss_p2s, ss_z1s, ss_z2s = [], [], [], []
+    #         for group in same_sized_groups:
+    #             ss_p1s.append(group(p1))
+    #             ss_p2s.append(group(p2))
+    #             ss_z1s.append(group(z1).detach())
+    #             ss_z2s.append(group(z2).detach())
+    #         p1s.append(ss_p1s)
+    #         p2s.append(ss_p2s)
+    #         z1s.append(ss_z1s)
+    #         z2s.append(ss_z2s)
+    #     return p1s, p2s, z1s, z2s
+
+
     def forward(self, x1, x2):
         p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
-        p1s, p2s, z1s, z2s = [], [], [], []
+        g1s, g2s = [], []
         for same_sized_groups in self.groups:
-            ss_p1s, ss_p2s, ss_z1s, ss_z2s = [], [], [], []
+            ss_g1s, ss_g2s = [], []
             for group in same_sized_groups:
-                ss_p1s.append(group(p1))
-                ss_p2s.append(group(p2))
-                ss_z1s.append(group(z1).detach())
-                ss_z2s.append(group(z2).detach())
-            p1s.append(ss_p1s)
-            p2s.append(ss_p2s)
-            z1s.append(ss_z1s)
-            z2s.append(ss_z2s)
-        return p1s, p2s, z1s, z2s
+                ss_g1s.append(group(p1))
+                ss_g2s.append(group(p2))
+            g1s.append(ss_g1s)
+            g2s.append(ss_g2s)
+        return p1, p2, z1, z2, g1s, g2s
