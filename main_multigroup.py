@@ -200,8 +200,8 @@ def main_worker(gpu, ngpus_per_node, args):
     print(model) # print model after SyncBatchNorm
 
     # define loss function (criterion) and optimizer
-    # criterion = nn.CosineSimilarity(dim=1).cuda(args.gpu)
-    criterion = crossentropy  # nn.CrossEntropyLoss()
+    criterion = nn.CosineSimilarity(dim=1).cuda(args.gpu)
+    # criterion = crossentropy  # nn.CrossEntropyLoss()
 
     if args.fix_pred_lr:
         optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
@@ -387,14 +387,14 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
 
         # compute output and loss
-        p1s, p2s, z1s, z2s = model(x1=images[0], x2=images[1])
-        ce = (criterion(p1s, z2s).mean() + criterion(p2s, z1s).mean()) * 0.5
-        memax = (me_max(p1s) + me_max(p2s)) * 0.5
+        p1, p2, z1, z2, gs = model(x1=images[0], x2=images[1])
+        ce = (criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
+        memax = me_max(gs)
         # div = (diversity(p1s) + diversity(p2s)) * 0.5
-        cov_w_s = (correlation(p1s, apply_softmax=True, corr=False) + correlation(p2s, apply_softmax=True, corr=False)) * 0.5
-        cov_wo_s = (correlation(p1s, apply_softmax=False, corr=False) + correlation(p2s, apply_softmax=False, corr=False)) * 0.5
-        corr_w_s = (correlation(p1s, apply_softmax=True, corr=True) + correlation(p2s, apply_softmax=True, corr=True)) * 0.5
-        corr_wo_s = (correlation(p1s, apply_softmax=False, corr=True) + correlation(p2s, apply_softmax=False, corr=True)) * 0.5
+        cov_w_s = correlation(gs, apply_softmax=True, corr=False)
+        cov_wo_s = correlation(gs, apply_softmax=False, corr=False)
+        corr_w_s = correlation(gs, apply_softmax=True, corr=True)
+        corr_wo_s = correlation(gs, apply_softmax=False, corr=True)
 
         loss = -ce + memax + corr_wo_s
         losses.update(loss.item(), images[0].size(0))

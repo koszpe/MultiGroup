@@ -97,12 +97,11 @@ class MultiGroup(SimSiam):
 
     def forward(self, x1, x2):
         p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
-        g1s, g2s = [], []
+        gs = []
+        p = torch.cat([p1, p2])
         for same_sized_groups in self.groups:
-            ss_g1s, ss_g2s = [], []
+            ss_gs = []
             for group in same_sized_groups:
-                ss_g1s.append(group(p1))
-                ss_g2s.append(group(p2))
-            g1s.append(ss_g1s)
-            g2s.append(ss_g2s)
-        return p1, p2, z1, z2, g1s, g2s
+                ss_gs.append(group(p))
+            gs.append(ss_gs)
+        return p1, p2, z1, z2, gs
