@@ -71,15 +71,15 @@ parser.add_argument('--world-size', default=1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=0, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='env://', type=str,
+parser.add_argument('--dist-url', default='tcp://localhost:10001', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
-parser.add_argument('--gpu', default=0, type=int,
+parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
-parser.add_argument('--multiprocessing-distributed', action='store_true',
+parser.add_argument('--no-multiprocessing-distributed', action='store_false',
                     dest="multiprocessing_distributed",
                     help='Use multi-processing distributed training to launch '
                          'N processes per node, which has N GPUs. This is the '
