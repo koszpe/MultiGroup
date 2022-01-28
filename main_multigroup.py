@@ -320,10 +320,7 @@ def me_max(qs):
     sum_loss = 0
     for ss_qs in qs:
         for q in ss_qs:
-            # avg_probs = torch.mean(sharpen(softmax(q)), dim=0)
             avg_probs = torch.mean(softmax(q), dim=0)
-            avg_probs = AllReduce.apply(avg_probs)
-            # sum_loss -= torch.sum(torch.log(avg_probs ** (-avg_probs)  + 1e-6))
             sum_loss -= torch.sum(-avg_probs * torch.log(avg_probs + 1e-6))
             loss_count += 1
     return sum_loss / loss_count
@@ -332,13 +329,9 @@ def correlation(qs, apply_softmax=True, corr=True):
     loss_count = 0
     sum_loss = 0
     for ss_qs in qs:
-        gathered_ss_qs = []
-        for q in ss_qs:
-            gathered_q = AllGather.apply(q)
-            gathered_ss_qs.append(gathered_q)
-        for i in range(len(gathered_ss_qs)):
-            for j in range(i + 1, len(gathered_ss_qs)):
-                q1, q2 = gathered_ss_qs[i], gathered_ss_qs[j]
+        for i in range(len(ss_qs)):
+            for j in range(i + 1, len(ss_qs)):
+                q1, q2 = ss_qs[i], ss_qs[j]
                 if apply_softmax:
                     q1, q2 = softmax(q1), softmax(q2)
                 normed_q1 = (q1 - q1.mean(dim=0))
@@ -377,13 +370,9 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
         p1, p2, z1, z2, gs = model(x1=images[0], x2=images[1])
         ce = (criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
         memax = me_max(gs)
-        # div = (diversity(p1s) + diversity(p2s)) * 0.5
-        cov_w_s = correlation(gs, apply_softmax=True, corr=False)
-        cov_wo_s = correlation(gs, apply_softmax=False, corr=False)
-        corr_w_s = correlation(gs, apply_softmax=True, corr=True)
-        corr_wo_s = correlation(gs, apply_softmax=False, corr=True)
+        corr = correlation(gs, apply_softmax=False, corr=True)
 
-        loss = -ce + memax + corr_wo_s
+        loss = -ce + memax + corr
         losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
@@ -399,12 +388,9 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
             progress.display(i)
 
         tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
-        tb_logger.add_scalar(tag="train/ce", scalar_value=ce.item())
+        tb_logger.add_scalar(tag="train/sim", scalar_value=ce.item())
         tb_logger.add_scalar(tag="train/memax", scalar_value=memax.item())
-        tb_logger.add_scalar(tag="train/covariance_w_softmax", scalar_value=cov_w_s.item())
-        tb_logger.add_scalar(tag="train/covariance_wo_softmax", scalar_value=cov_wo_s.item())
-        tb_logger.add_scalar(tag="train/corr_w_softmax", scalar_value=corr_w_s.item())
-        tb_logger.add_scalar(tag="train/corr_wo_softmax", scalar_value=corr_wo_s.item())
+        tb_logger.add_scalar(tag="train/corr", scalar_value=corr.item())
         tb_logger.step()
 
 

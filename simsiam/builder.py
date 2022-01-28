@@ -7,6 +7,9 @@
 import torch
 import torch.nn as nn
 
+from mp_utils import AllGather
+
+
 class SimSiam(nn.Module):
     """
     Build a SimSiam model.
@@ -67,16 +70,15 @@ class MultiGroup(SimSiam):
         super(MultiGroup, self).__init__(*args, **kwargs)
         self.group_sizes = group_sizes
         self.group_nums = group_nums
-        i = 0
-        self.groups = []
+        self.group_slices = []
+        merged_gs = 0
         for gs, gn in zip(group_sizes, group_nums):
-            same_sized_groups = []
+            ss_group_slices = []
             for _ in range(gn):
-                group = nn.Linear(self.dim, gs)
-                setattr(self, f"group_{gs}_{i}", group)
-                i += 1
-                same_sized_groups.append(group)
-            self.groups.append(same_sized_groups)
+                ss_group_slices.append(slice(merged_gs, merged_gs + gs))
+                merged_gs += gs
+            self.group_slices.append(ss_group_slices)
+        self.group_head = nn.Linear(self.dim, merged_gs)
 
     # def forward(self, x1, x2):
     #     p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
@@ -99,9 +101,11 @@ class MultiGroup(SimSiam):
         p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
         gs = []
         p = torch.cat([p1, p2])
-        for same_sized_groups in self.groups:
+        groups = self.group_head(p)
+        groups = AllGather.apply(groups)
+        for ss_group_slices in self.group_slices:
             ss_gs = []
-            for group in same_sized_groups:
-                ss_gs.append(group(p))
+            for group_slice in ss_group_slices:
+                ss_gs.append(groups[:, group_slice])
             gs.append(ss_gs)
         return p1, p2, z1, z2, gs
