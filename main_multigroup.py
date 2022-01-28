@@ -98,8 +98,8 @@ parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
-parser.add_argument("--group-sizes", default=[2, 16, 64, 128], help="Size of the groups to create")
-parser.add_argument("--group-nums", default= [4, 4,  4,  4], help="Num of the grous")
+parser.add_argument("--group-sizes", default=[2, 16, 32, 64], help="Size of the groups to create")
+parser.add_argument("--group-nums", default= [16, 8,  4,  4], help="Num of the grous")
 
 def main():
     args = parser.parse_args()
