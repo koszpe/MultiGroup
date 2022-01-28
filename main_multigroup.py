@@ -29,6 +29,7 @@ import torchvision.models as models
 
 import simsiam.loader
 import simsiam.builder
+from mp_utils import AllReduce, AllGather
 from simsiam.logger import TBLogger
 
 model_names = sorted(name for name in models.__dict__
@@ -321,13 +322,7 @@ def me_max(qs):
         for q in ss_qs:
             # avg_probs = torch.mean(sharpen(softmax(q)), dim=0)
             avg_probs = torch.mean(softmax(q), dim=0)
-            if (
-                    dist.is_available()
-                    and dist.is_initialized()
-                    and (dist.get_world_size() > 1)
-            ):
-                avg_probs = avg_probs.contiguous() / dist.get_world_size()
-                dist.all_reduce(avg_probs)
+            avg_probs = AllReduce.apply(avg_probs)
             # sum_loss -= torch.sum(torch.log(avg_probs ** (-avg_probs)  + 1e-6))
             sum_loss -= torch.sum(-avg_probs * torch.log(avg_probs + 1e-6))
             loss_count += 1
@@ -337,18 +332,10 @@ def correlation(qs, apply_softmax=True, corr=True):
     loss_count = 0
     sum_loss = 0
     for ss_qs in qs:
-        if (
-                dist.is_available()
-                and dist.is_initialized()
-                and (dist.get_world_size() > 1)
-        ):
-            gathered_ss_qs = []
-            for q in ss_qs:
-                    gathered_q = [torch.zeros_like(q) for _ in range(dist.get_world_size())]
-                    dist.all_gather(gathered_q, q)
-                    gathered_ss_qs.append(torch.cat(gathered_q, 0))
-        else:
-            gathered_ss_qs = ss_qs
+        gathered_ss_qs = []
+        for q in ss_qs:
+            gathered_q = AllGather.apply(q)
+            gathered_ss_qs.append(gathered_q)
         for i in range(len(gathered_ss_qs)):
             for j in range(i + 1, len(gathered_ss_qs)):
                 q1, q2 = gathered_ss_qs[i], gathered_ss_qs[j]
