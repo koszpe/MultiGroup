@@ -40,10 +40,10 @@ class SimSiam(nn.Module):
         self.encoder.fc[6].bias.requires_grad = False # hack: not use bias as it is followed by BN
 
         # build a 2-layer predictor
-        self.predictor = nn.Sequential(nn.Linear(dim, pred_dim, bias=False),
-                                        nn.BatchNorm1d(pred_dim),
-                                        nn.ReLU(inplace=True), # hidden layer
-                                        nn.Linear(pred_dim, dim)) # output layer
+        # self.predictor = nn.Sequential(nn.Linear(dim, pred_dim, bias=False),
+        #                                 nn.BatchNorm1d(pred_dim),
+        #                                 nn.ReLU(inplace=True), # hidden layer
+        #                                 nn.Linear(pred_dim, dim)) # output layer
 
     def forward(self, x1, x2):
         """
@@ -59,8 +59,8 @@ class SimSiam(nn.Module):
         z1 = self.encoder(x1) # NxC
         z2 = self.encoder(x2) # NxC
 
-        p1 = self.predictor(z1) # NxC
-        p2 = self.predictor(z2) # NxC
+        p1 = z1 # self.predictor(z1) # NxC
+        p2 = z2 # self.predictor(z2) # NxC
 
         return p1, p2, z1.detach(), z2.detach()
 

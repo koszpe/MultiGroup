@@ -98,8 +98,10 @@ parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
-parser.add_argument("--group-sizes", default=[2, 16, 32, 64], help="Size of the groups to create")
-parser.add_argument("--group-nums", default= [16, 8,  4,  4], help="Num of the grous")
+parser.add_argument("--group-sizes", default=[2, 16, 32, 64], type=int, nargs="+", help="Size of the groups to create")
+parser.add_argument("--group-nums", default= [16, 8,  4,  4], type=int, nargs="+", help="Num of the grous")
+parser.add_argument('--no-cossim', action='store_false', dest="use_cossim",
+                    help='Fix learning rate for the predictor')
 
 def main():
     args = parser.parse_args()
@@ -205,8 +207,9 @@ def main_worker(gpu, ngpus_per_node, args):
     # criterion = crossentropy  # nn.CrossEntropyLoss()
 
     if args.fix_pred_lr:
-        optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
-                        {'params': model.module.predictor.parameters(), 'fix_lr': True}]
+        # optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
+        #                 {'params': model.module.predictor.parameters(), 'fix_lr': True}]
+        optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False}]
     else:
         optim_params = model.parameters()
 
@@ -315,13 +318,23 @@ def crossentropy(ps, qs):
             loss_count += 1
     return sum_loss / loss_count
 
+def entropy(ps):
+    loss_count = 0
+    sum_loss = 0
+    for ss_ps in ps:
+        for p in ss_ps:
+            p = softmax(p)
+            sum_loss -= torch.sum(p * torch.log(p+1e-6)) / len(p)
+            loss_count += 1
+    return sum_loss / loss_count
+
 def me_max(qs):
     loss_count = 0
     sum_loss = 0
     for ss_qs in qs:
         for q in ss_qs:
             avg_probs = torch.mean(softmax(q), dim=0)
-            sum_loss -= torch.sum(-avg_probs * torch.log(avg_probs + 1e-6))
+            sum_loss -= torch.sum(avg_probs * torch.log(avg_probs + 1e-6))
             loss_count += 1
     return sum_loss / loss_count
 
@@ -368,11 +381,14 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
 
         # compute output and loss
         p1, p2, z1, z2, gs = model(x1=images[0], x2=images[1])
-        ce = (criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
+        similarity = (criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
         memax = me_max(gs)
         corr = correlation(gs, apply_softmax=False, corr=True)
-
-        loss = -ce + memax + corr
+        ent = entropy(gs)
+        loss = .0
+        if args.use_cossim:
+            loss -= similarity
+        loss += (-memax -ent + corr)
         losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
@@ -388,9 +404,10 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
             progress.display(i)
 
         tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
-        tb_logger.add_scalar(tag="train/sim", scalar_value=ce.item())
+        tb_logger.add_scalar(tag="train/sim", scalar_value=similarity.item())
         tb_logger.add_scalar(tag="train/memax", scalar_value=memax.item())
         tb_logger.add_scalar(tag="train/corr", scalar_value=corr.item())
+        tb_logger.add_scalar(tag="train/ent", scalar_value=ent.item())
         tb_logger.step()
 
 
