@@ -40,10 +40,10 @@ class SimSiam(nn.Module):
         self.encoder.fc[6].bias.requires_grad = False # hack: not use bias as it is followed by BN
 
         # build a 2-layer predictor
-        # self.predictor = nn.Sequential(nn.Linear(dim, pred_dim, bias=False),
-        #                                 nn.BatchNorm1d(pred_dim),
-        #                                 nn.ReLU(inplace=True), # hidden layer
-        #                                 nn.Linear(pred_dim, dim)) # output layer
+        self.predictor = nn.Sequential(nn.Linear(dim, pred_dim, bias=False),
+                                        nn.BatchNorm1d(pred_dim),
+                                        nn.ReLU(inplace=True), # hidden layer
+                                        nn.Linear(pred_dim, dim)) # output layer
 
     def forward(self, x1, x2):
         """
@@ -59,8 +59,10 @@ class SimSiam(nn.Module):
         z1 = self.encoder(x1) # NxC
         z2 = self.encoder(x2) # NxC
 
-        p1 = z1 # self.predictor(z1) # NxC
-        p2 = z2 # self.predictor(z2) # NxC
+        # p1 = z1
+        # p2 = z2
+        p1 = self.predictor(z1) # NxC
+        p2 = self.predictor(z2) # NxC
 
         return p1, p2, z1.detach(), z2.detach()
 
@@ -73,29 +75,9 @@ class MultiGroup(SimSiam):
         self.group_slices = []
         merged_gs = 0
         for gs, gn in zip(group_sizes, group_nums):
-            ss_group_slices = []
-            for _ in range(gn):
-                ss_group_slices.append(slice(merged_gs, merged_gs + gs))
-                merged_gs += gs
-            self.group_slices.append(ss_group_slices)
+            self.group_slices.append(slice(merged_gs, merged_gs + gs * gn))
+            merged_gs += gs * gn
         self.group_head = nn.Linear(self.dim, merged_gs)
-
-    # def forward(self, x1, x2):
-    #     p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
-    #     p1s, p2s, z1s, z2s = [], [], [], []
-    #     for same_sized_groups in self.groups:
-    #         ss_p1s, ss_p2s, ss_z1s, ss_z2s = [], [], [], []
-    #         for group in same_sized_groups:
-    #             ss_p1s.append(group(p1))
-    #             ss_p2s.append(group(p2))
-    #             ss_z1s.append(group(z1).detach())
-    #             ss_z2s.append(group(z2).detach())
-    #         p1s.append(ss_p1s)
-    #         p2s.append(ss_p2s)
-    #         z1s.append(ss_z1s)
-    #         z2s.append(ss_z2s)
-    #     return p1s, p2s, z1s, z2s
-
 
     def forward(self, x1, x2):
         p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
@@ -103,9 +85,8 @@ class MultiGroup(SimSiam):
         p = torch.cat([p1, p2])
         groups = self.group_head(p)
         groups = AllGather.apply(groups)
-        for ss_group_slices in self.group_slices:
-            ss_gs = []
-            for group_slice in ss_group_slices:
-                ss_gs.append(groups[:, group_slice])
-            gs.append(ss_gs)
+        bs = groups.shape[0]
+        for g_slice, g_size, g_num in zip(self.group_slices, self.group_sizes, self.group_nums):
+            group = groups[:, g_slice].view(bs, g_num, g_size).permute(1, 0, 2).contiguous() # group_num x batch_size x group_size
+            gs.append(group)
         return p1, p2, z1, z2, gs

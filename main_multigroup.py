@@ -102,6 +102,12 @@ parser.add_argument("--group-sizes", default=[2, 16, 32, 64], type=int, nargs="+
 parser.add_argument("--group-nums", default= [16, 8,  4,  4], type=int, nargs="+", help="Num of the grous")
 parser.add_argument('--no-cossim', action='store_false', dest="use_cossim",
                     help='Fix learning rate for the predictor')
+parser.add_argument('--no-corr', action='store_false', dest="use_corr",
+                    help='Fix learning rate for the predictor')
+parser.add_argument('--no-memax', action='store_false', dest="use_memax",
+                    help='Fix learning rate for the predictor')
+parser.add_argument('--no-entropy', action='store_false', dest="use_ent",
+                    help='Fix learning rate for the predictor')
 
 def main():
     args = parser.parse_args()
@@ -203,13 +209,17 @@ def main_worker(gpu, ngpus_per_node, args):
     print(model) # print model after SyncBatchNorm
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CosineSimilarity(dim=1).cuda(args.gpu)
-    # criterion = crossentropy  # nn.CrossEntropyLoss()
+    criterion = create_loss(
+        use_cossim=args.use_cossim,
+        use_corr=args.use_corr,
+        use_memax=args.use_memax,
+        use_ent=args.use_ent,
+    )
 
     if args.fix_pred_lr:
-        # optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
-        #                 {'params': model.module.predictor.parameters(), 'fix_lr': True}]
-        optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False}]
+        optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
+                        {'params': model.module.predictor.parameters(), 'fix_lr': True}]
+        # optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False}]
     else:
         optim_params = model.parameters()
 
@@ -283,8 +293,8 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
-        with torch.autograd.set_detect_anomaly(True):
-            train(train_loader, model, criterion, optimizer, epoch, tb_logger, args)
+        # with torch.autograd.set_detect_anomaly(True):
+        train(train_loader, model, criterion, optimizer, epoch, tb_logger, args)
 
         if (epoch + 1) % args.save_frequency == 0 or epoch == 0:
             filename = os.path.join(folder, 'checkpoint_{:04d}.pt'.format(epoch+1))
@@ -338,25 +348,41 @@ def me_max(qs):
             loss_count += 1
     return sum_loss / loss_count
 
-def correlation(qs, apply_softmax=True, corr=True):
-    loss_count = 0
-    sum_loss = 0
-    for ss_qs in qs:
-        for i in range(len(ss_qs)):
-            for j in range(i + 1, len(ss_qs)):
-                q1, q2 = ss_qs[i], ss_qs[j]
-                if apply_softmax:
-                    q1, q2 = softmax(q1), softmax(q2)
-                normed_q1 = (q1 - q1.mean(dim=0))
-                normed_q2 = (q2 - q2.mean(dim=0))
-                if corr:
-                    normed_q1 /= q1.std()
-                    normed_q2 /= q2.std()
-                corr_m = (normed_q1.T @ normed_q2) / (q1.shape[0] - 1)
-                sum_loss += corr_m.abs().mean()
+def create_loss(use_cossim, use_ent, use_corr, use_memax):
+    cossim = nn.CosineSimilarity(dim=1)
+    def compute_all_loss(p1, p2, z1, z2, gs):
+        losses = dict()
+        losses["cos_sim"] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
+        losses["memax"] = me_max(gs)
+        losses["corr"] = correlation(gs, apply_softmax=False, corr=True)
+        losses["ent"] = entropy(gs)
+        if not use_cossim:
+            losses["cos_sim"] = losses["cos_sim"].detach()
+        if not use_ent:
+            losses["ent"] = losses["ent"].detach()
+        if not use_corr:
+            losses["corr"] = losses["corr"].detach()
+        if not use_memax:
+            losses["memax"] = losses["memax"].detach()
+        return losses
+    return compute_all_loss
 
-                loss_count += 1
-    return sum_loss / loss_count
+softm = torch.nn.Softmax(dim=-1)
+def correlation(qs, apply_softmax=True, corr=True):
+    sum_corr = 0
+    for q in qs:
+        q = q.clone().double()
+        if apply_softmax:
+            q = softm(q)
+        q = q - q.mean(dim=1, keepdim=True)
+        if corr:
+            q = q / q.std(dim=1, keepdim=True)
+        tril_indices = torch.tril_indices(q.shape[0], q.shape[1], offset=-1)
+        corr_m = torch.einsum("nbi,mbj->nmij", q, q) / (q.shape[1] - 1)
+        sum_corr += corr_m[tril_indices[0], tril_indices[1], :, :].abs().mean()
+    sum_corr /= len(qs)
+
+    return sum_corr
 
 def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -381,14 +407,8 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
 
         # compute output and loss
         p1, p2, z1, z2, gs = model(x1=images[0], x2=images[1])
-        similarity = (criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
-        memax = me_max(gs)
-        corr = correlation(gs, apply_softmax=False, corr=True)
-        ent = entropy(gs)
-        loss = .0
-        if args.use_cossim:
-            loss -= similarity
-        loss += (-memax -ent + corr)
+        losses = criterion(p1, p2, z1, z2, gs)
+        loss = - losses["cossim"] + losses["corr"] - losses["memax"] - losses["ent"]
         losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
@@ -404,10 +424,10 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
             progress.display(i)
 
         tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
-        tb_logger.add_scalar(tag="train/sim", scalar_value=similarity.item())
-        tb_logger.add_scalar(tag="train/memax", scalar_value=memax.item())
-        tb_logger.add_scalar(tag="train/corr", scalar_value=corr.item())
-        tb_logger.add_scalar(tag="train/ent", scalar_value=ent.item())
+        tb_logger.add_scalar(tag="train/sim", scalar_value=losses["cossim"].item())
+        tb_logger.add_scalar(tag="train/memax", scalar_value=losses["memax"].item())
+        tb_logger.add_scalar(tag="train/corr", scalar_value=losses["corr"].item())
+        tb_logger.add_scalar(tag="train/ent", scalar_value=losses["ent"].item())
         tb_logger.step()
 
 
