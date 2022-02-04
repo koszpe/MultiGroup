@@ -390,7 +390,7 @@ def correlation(qs, apply_softmax=True, corr=True):
     return sum_corr
 
 def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args):
-    log_per_step = 1000
+    log_per_step = 10000
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4f')
