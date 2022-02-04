@@ -27,11 +27,17 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+import simsiam.loader
+import simsiam.builder
+from mp_utils import AllReduce, AllGather
+from simsiam.logger import TBLogger
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+parser.add_argument("--runname", default="dev", help="Name of run on tensorboard")
 parser.add_argument('--data', metavar='DIR',
                     help='path to dataset', default='/shared_data/imagenet')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
@@ -41,33 +47,31 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                         ' (default: resnet50)')
 parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=4096, type=int,
+parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N',
-                    help='mini-batch size (default: 4096), this is the total '
+                    help='mini-batch size (default: 512), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+parser.add_argument('--lr', '--learning-rate', default=0.05, type=float,
                     metavar='LR', help='initial (base) learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
-                    help='momentum')
-parser.add_argument('--wd', '--weight-decay', default=0., type=float,
-                    metavar='W', help='weight decay (default: 0.)',
+                    help='momentum of SGD solver')
+parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
+                    metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
-parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
-                    help='evaluate model on validation set')
 parser.add_argument('--world-size', default=1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=0, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://localhost:10005', type=str,
+parser.add_argument('--dist-url', default='tcp://localhost:10001', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -82,14 +86,28 @@ parser.add_argument('--no-multiprocessing-distributed', action='store_false',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
-# additional configs:
-parser.add_argument('--pretrained', default='', type=str,
-                    help='path to simsiam pretrained checkpoint')
-parser.add_argument('--no-lars', action='store_false', dest="lars",
-                    help='Use LARS')
+# simsiam specific configs:
+parser.add_argument('--dim', default=2048, type=int,
+                    help='feature dimension (default: 2048)')
+parser.add_argument('--pred-dim', default=512, type=int,
+                    help='hidden dimension of the predictor (default: 512)')
+parser.add_argument('--no-fix-pred-lr', action='store_false', dest="fix_pred_lr",
+                    help='Fix learning rate for the predictor')
 
-best_acc1 = 0
+parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
+                    help='Where to log')
+parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
+parser.add_argument("--group-sizes", default=[2, 16, 32, 64], type=int, nargs="+", help="Size of the groups to create")
+parser.add_argument("--group-nums", default= [16, 8,  4,  4], type=int, nargs="+", help="Num of the grous")
+parser.add_argument('--no-cossim', action='store_false', dest="use_cossim",
+                    help='Fix learning rate for the predictor')
+parser.add_argument('--no-corr', action='store_false', dest="use_corr",
+                    help='Fix learning rate for the predictor')
+parser.add_argument('--no-memax', action='store_false', dest="use_memax",
+                    help='Fix learning rate for the predictor')
+parser.add_argument('--no-entropy', action='store_false', dest="use_ent",
+                    help='Fix learning rate for the predictor')
 
 def main():
     args = parser.parse_args()
@@ -127,7 +145,6 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
-    global best_acc1
     args.gpu = gpu
 
     # suppress printing if not master
@@ -151,44 +168,18 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.distributed.barrier()
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = models.__dict__[args.arch]()
-
-    # freeze all layers but the last fc
-    for name, param in model.named_parameters():
-        if name not in ['fc.weight', 'fc.bias']:
-            param.requires_grad = False
-    # init the fc layer
-    model.fc.weight.data.normal_(mean=0.0, std=0.01)
-    model.fc.bias.data.zero_()
-
-    # load from pre-trained, before DistributedDataParallel constructor
-    if args.pretrained:
-        if os.path.isfile(args.pretrained):
-            print("=> loading checkpoint '{}'".format(args.pretrained))
-            checkpoint = torch.load(args.pretrained, map_location="cpu")
-
-            # rename moco pre-trained keys
-            state_dict = checkpoint['state_dict']
-            for k in list(state_dict.keys()):
-                # retain only encoder up to before the embedding layer
-                if k.startswith('module.encoder') and not k.startswith('module.encoder.fc'):
-                    # remove prefix
-                    state_dict[k[len("module.encoder."):]] = state_dict[k]
-                # delete renamed or unused k
-                del state_dict[k]
-
-            args.start_epoch = 0
-            msg = model.load_state_dict(state_dict, strict=False)
-            assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}
-
-            print("=> loaded pre-trained model '{}'".format(args.pretrained))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.pretrained))
+    model = simsiam.builder.MultiGroup(
+        args.group_sizes,
+        args.group_nums,
+        models.__dict__[args.arch],
+        args.dim, args.pred_dim)
 
     # infer learning rate before changing batch size
     init_lr = args.lr * args.batch_size / 256
 
     if args.distributed:
+        # Apply SyncBN
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
         # DistributedDataParallel will use all available devices.
@@ -209,28 +200,32 @@ def main_worker(gpu, ngpus_per_node, args):
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
+        # comment out the following line for debugging
+        # raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
-        # DataParallel will divide and allocate batch_size to all available GPUs
-        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
-            model.features = torch.nn.DataParallel(model.features)
-            model.cuda()
-        else:
-            model = torch.nn.DataParallel(model).cuda()
+        # AllGather implementation (batch shuffle, queue update, etc.) in
+        # this code only supports DistributedDataParallel.
+        raise NotImplementedError("Only DistributedDataParallel is supported.")
+    print(model) # print model after SyncBatchNorm
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion = create_loss(
+        use_cossim=args.use_cossim,
+        use_corr=args.use_corr,
+        use_memax=args.use_memax,
+        use_ent=args.use_ent,
+    )
 
-    # optimize only the linear classifier
-    parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
-    assert len(parameters) == 2  # fc.weight, fc.bias
+    if args.fix_pred_lr:
+        optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
+                        {'params': model.module.predictor.parameters(), 'fix_lr': True}]
+        # optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False}]
+    else:
+        optim_params = model.parameters()
 
-    optimizer = torch.optim.SGD(parameters, init_lr,
+    optimizer = torch.optim.SGD(optim_params, init_lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
-    if args.lars:
-        print("=> use LARS optimizer.")
-        from apex.parallel.LARC import LARC
-        optimizer = LARC(optimizer=optimizer, trust_coefficient=.001, clip=False)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -243,10 +238,6 @@ def main_worker(gpu, ngpus_per_node, args):
                 loc = 'cuda:{}'.format(args.gpu)
                 checkpoint = torch.load(args.resume, map_location=loc)
             args.start_epoch = checkpoint['epoch']
-            best_acc1 = checkpoint['best_acc1']
-            if args.gpu is not None:
-                # best_acc1 may be from a checkpoint from a different GPU
-                best_acc1 = best_acc1.to(args.gpu)
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
@@ -258,18 +249,25 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # Data loading code
     traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
+    # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
+    augmentation = [
+        transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+        transforms.RandomApply([
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
+        ], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.RandomApply([simsiam.loader.GaussianBlur([.1, 2.])], p=0.5),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize
+    ]
+
     train_dataset = datasets.ImageFolder(
         traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
+        simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -278,21 +276,16 @@ def main_worker(gpu, ngpus_per_node, args):
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
-    val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=256, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+    global_step = len(train_loader) * args.start_epoch
+    folder = os.path.join(args.logdir, args.runname)
+    os.makedirs(folder, exist_ok=True)
+    tb_logger = TBLogger(log_dir=folder,
+                         global_step=global_step,
+                         batch_size=args.batch_size,
+                         world_size=args.world_size)
 
-    if args.evaluate:
-        validate(val_loader, model, criterion, args)
-        return
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -300,66 +293,123 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        # with torch.autograd.set_detect_anomaly(True):
+        train(train_loader, model, criterion, optimizer, epoch, tb_logger, args)
 
-        # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
-
-        # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
-
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
+        if (epoch + 1) % args.save_frequency == 0 or epoch == 0:
+            filename = os.path.join(folder, 'checkpoint_{:04d}.pt'.format(epoch+1))
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
-                'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best)
-            if epoch == args.start_epoch:
-                sanity_check(model.state_dict(), args.pretrained)
+            }, is_best=False, filename=filename)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def sharpen(p, T=0.25):
+    sharp_p = p**(1./T)
+    sharp_p /= torch.sum(sharp_p, dim=1, keepdim=True)
+    return sharp_p
+
+sm = torch.nn.Softmax(dim=1)
+def softmax(x):
+    return sm(x - x.max(dim=1, keepdim=True)[0])
+
+def crossentropy(ps, qs):
+    loss_count = 0
+    sum_loss = 0
+    for ss_ps, ss_qs in zip(ps, qs):
+        for p, q in zip(ss_ps, ss_qs):
+            p = softmax(p)
+            # p[p<1-4] = 0
+            # p = sharpen(p)
+            q = softmax(q)
+            sum_loss -= torch.sum(p * torch.log(q+1e-6)) / len(p)
+            loss_count += 1
+    return sum_loss / loss_count
+
+def entropy(ps):
+    loss_count = 0
+    sum_loss = 0
+    for ss_ps in ps:
+        for p in ss_ps:
+            p = softmax(p)
+            sum_loss -= torch.sum(p * torch.log(p+1e-6)) / len(p)
+            loss_count += 1
+    return sum_loss / loss_count
+
+def me_max(qs):
+    loss_count = 0
+    sum_loss = 0
+    for ss_qs in qs:
+        for q in ss_qs:
+            avg_probs = torch.mean(softmax(q), dim=0)
+            sum_loss -= torch.sum(avg_probs * torch.log(avg_probs + 1e-6))
+            loss_count += 1
+    return sum_loss / loss_count
+
+def create_loss(use_cossim, use_ent, use_corr, use_memax):
+    cossim = nn.CosineSimilarity(dim=1)
+    def compute_all_loss(p1, p2, z1, z2, gs):
+        losses = dict()
+        losses["cos_sim"] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
+        losses["memax"] = me_max(gs)
+        losses["corr"] = correlation(gs, apply_softmax=False, corr=True)
+        losses["ent"] = entropy(gs)
+        if not use_cossim:
+            losses["cos_sim"] = losses["cos_sim"].detach()
+        if not use_ent:
+            losses["ent"] = losses["ent"].detach()
+        if not use_corr:
+            losses["corr"] = losses["corr"].detach()
+        if not use_memax:
+            losses["memax"] = losses["memax"].detach()
+        return losses
+    return compute_all_loss
+
+softm = torch.nn.Softmax(dim=-1)
+def correlation(qs, apply_softmax=True, corr=True):
+    sum_corr = 0
+    for q in qs:
+        q = q.clone().double()
+        if apply_softmax:
+            q = softm(q)
+        q = q - q.mean(dim=1, keepdim=True)
+        if corr:
+            q = q / q.std(dim=1, keepdim=True)
+        tril_indices = torch.tril_indices(q.shape[0], q.shape[1], offset=-1)
+        corr_m = torch.einsum("nbi,mbj->nmij", q, q) / (q.shape[1] - 1)
+        sum_corr += corr_m[tril_indices[0], tril_indices[1], :, :].abs().mean()
+    sum_corr /= len(qs)
+
+    return sum_corr
+
+def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
+    losses = AverageMeter('Loss', ':.4f')
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, top1, top5],
+        [batch_time, data_time, losses],
         prefix="Epoch: [{}]".format(epoch))
 
-    """
-    Switch to eval mode:
-    Under the protocol of linear classification on frozen features/models,
-    it is not legitimate to change any part of the pre-trained model.
-    BatchNorm in train mode may revise running mean/std (even if it receives
-    no gradient), which are part of the model parameters too.
-    """
-    model.eval()
+    # switch to train mode
+    model.train()
 
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    for i, (images, _) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
+            images[0] = images[0].cuda(args.gpu, non_blocking=True)
+            images[1] = images[1].cuda(args.gpu, non_blocking=True)
 
-        # compute output
-        output = model(images)
-        loss = criterion(output, target)
-
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        # compute output and loss
+        p1, p2, z1, z2, gs = model(x1=images[0], x2=images[1])
+        losses = criterion(p1, p2, z1, z2, gs)
+        loss = - losses["cossim"] + losses["corr"] - losses["memax"] - losses["ent"]
+        losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -373,79 +423,18 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         if i % args.print_freq == 0:
             progress.display(i)
 
-
-def validate(val_loader, model, criterion, args):
-    batch_time = AverageMeter('Time', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses, top1, top5],
-        prefix='Test: ')
-
-    # switch to evaluate mode
-    model.eval()
-
-    with torch.no_grad():
-        end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
-
-            # compute output
-            output = model(images)
-            loss = criterion(output, target)
-
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
-            top1.update(acc1[0], images.size(0))
-            top5.update(acc5[0], images.size(0))
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if i % args.print_freq == 0:
-                progress.display(i)
-
-        # TODO: this should also be done with the ProgressMeter
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
-
-    return top1.avg
+        tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
+        tb_logger.add_scalar(tag="train/sim", scalar_value=losses["cossim"].item())
+        tb_logger.add_scalar(tag="train/memax", scalar_value=losses["memax"].item())
+        tb_logger.add_scalar(tag="train/corr", scalar_value=losses["corr"].item())
+        tb_logger.add_scalar(tag="train/ent", scalar_value=losses["ent"].item())
+        tb_logger.step()
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
-
-
-def sanity_check(state_dict, pretrained_weights):
-    """
-    Linear classifier should not change any weights other than the linear layer.
-    This sanity check asserts nothing wrong happens (e.g., BN stats updated).
-    """
-    print("=> loading '{}' for sanity check".format(pretrained_weights))
-    checkpoint = torch.load(pretrained_weights, map_location="cpu")
-    state_dict_pre = checkpoint['state_dict']
-
-    for k in list(state_dict.keys()):
-        # only ignore fc layer
-        if 'fc.weight' in k or 'fc.bias' in k:
-            continue
-
-        # name in pretrained model
-        k_pre = 'module.encoder.' + k[len('module.'):] \
-            if k.startswith('module.') else 'module.encoder.' + k
-
-        assert ((state_dict[k].cpu() == state_dict_pre[k_pre]).all()), \
-            '{} is changed in linear classifier training.'.format(k)
-
-    print("=> sanity check passed.")
 
 
 class AverageMeter(object):
@@ -493,24 +482,10 @@ def adjust_learning_rate(optimizer, init_lr, epoch, args):
     """Decay the learning rate based on schedule"""
     cur_lr = init_lr * 0.5 * (1. + math.cos(math.pi * epoch / args.epochs))
     for param_group in optimizer.param_groups:
-        param_group['lr'] = cur_lr
-
-
-def accuracy(output, target, topk=(1,)):
-    """Computes the accuracy over the k top predictions for the specified values of k"""
-    with torch.no_grad():
-        maxk = max(topk)
-        batch_size = target.size(0)
-
-        _, pred = output.topk(maxk, 1, True, True)
-        pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
-
-        res = []
-        for k in topk:
-            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
-        return res
+        if 'fix_lr' in param_group and param_group['fix_lr']:
+            param_group['lr'] = init_lr
+        else:
+            param_group['lr'] = cur_lr
 
 
 if __name__ == '__main__':

@@ -7,6 +7,9 @@
 import torch
 import torch.nn as nn
 
+from mp_utils import AllGather
+
+
 class SimSiam(nn.Module):
     """
     Build a SimSiam model.
@@ -56,24 +59,34 @@ class SimSiam(nn.Module):
         z1 = self.encoder(x1) # NxC
         z2 = self.encoder(x2) # NxC
 
+        # p1 = z1
+        # p2 = z2
         p1 = self.predictor(z1) # NxC
         p2 = self.predictor(z2) # NxC
 
         return p1, p2, z1.detach(), z2.detach()
 
-class ProposedModel(SimSiam):
+class MultiGroup(SimSiam):
 
-    def __init__(self, *args, **kwargs):
-        super(ProposedModel, self).__init__(*args, **kwargs)
-        self.n_classes = kwargs.get("n_classes", 2048)
-        self.clusters = nn.Linear(self.dim, self.n_classes)
-
+    def __init__(self, group_sizes, group_nums, *args, **kwargs):
+        super(MultiGroup, self).__init__(*args, **kwargs)
+        self.group_sizes = group_sizes
+        self.group_nums = group_nums
+        self.group_slices = []
+        merged_gs = 0
+        for gs, gn in zip(group_sizes, group_nums):
+            self.group_slices.append(slice(merged_gs, merged_gs + gs * gn))
+            merged_gs += gs * gn
+        self.group_head = nn.Linear(self.dim, merged_gs)
 
     def forward(self, x1, x2):
-        p1, p2, z1, z2 = super(ProposedModel, self).forward(x1, x2)
-        p1 = self.clusters(p1)
-        p2 = self.clusters(p2)
-        z1 = self.clusters(z1)
-        z2 = self.clusters(z2)
-
-        return p1, p2, z1.detach(), z2.detach()
+        p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
+        gs = []
+        p = torch.cat([p1, p2])
+        groups = self.group_head(p)
+        groups = AllGather.apply(groups)
+        bs = groups.shape[0]
+        for g_slice, g_size, g_num in zip(self.group_slices, self.group_sizes, self.group_nums):
+            group = groups[:, g_slice].view(bs, g_num, g_size).permute(1, 0, 2).contiguous() # group_num x batch_size x group_size
+            gs.append(group)
+        return p1, p2, z1, z2, gs
