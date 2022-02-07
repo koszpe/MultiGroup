@@ -29,6 +29,7 @@ import torchvision.models as models
 
 import simsiam.loader
 import simsiam.builder
+from evaluator import SnnEvaluator
 from mp_utils import AllReduce, AllGather
 from simsiam.logger import TBLogger
 
@@ -174,6 +175,8 @@ def main_worker(gpu, ngpus_per_node, args):
         models.__dict__[args.arch],
         args.dim, args.pred_dim)
 
+    evaluator = SnnEvaluator(dim=args.dim, n_classes=1000, max_queue_size=10)
+
     # infer learning rate before changing batch size
     init_lr = args.lr * args.batch_size / 256
 
@@ -186,6 +189,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
+            evaluator.cuda(args.gpu)
             # When using a single GPU per process and per
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
@@ -194,12 +198,14 @@ def main_worker(gpu, ngpus_per_node, args):
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
+            evaluator.cuda()
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
+        evaluator = evaluator.cuda(args.gpu)
         # comment out the following line for debugging
         # raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
@@ -284,8 +290,7 @@ def main_worker(gpu, ngpus_per_node, args):
     tb_logger = TBLogger(log_dir=folder,
                          global_step=global_step,
                          batch_size=args.batch_size,
-                         world_size=args.world_size)
-
+                         world_size=args.world_size if args.distributed else 1)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -294,7 +299,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # train for one epoch
         # with torch.autograd.set_detect_anomaly(True):
-        train(train_loader, model, criterion, optimizer, epoch, tb_logger, args)
+        train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args)
 
         if (epoch + 1) % args.save_frequency == 0 or epoch == 0:
             filename = os.path.join(folder, 'checkpoint_{:04d}.pt'.format(epoch+1))
@@ -352,12 +357,12 @@ def create_loss(use_cossim, use_ent, use_corr, use_memax):
     cossim = nn.CosineSimilarity(dim=1)
     def compute_all_loss(p1, p2, z1, z2, gs):
         losses = dict()
-        losses["cos_sim"] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
+        losses["cossim"] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
         losses["memax"] = me_max(gs)
         losses["corr"] = correlation(gs, apply_softmax=False, corr=True)
         losses["ent"] = entropy(gs)
         if not use_cossim:
-            losses["cos_sim"] = losses["cos_sim"].detach()
+            losses["cossim"] = losses["cossim"].detach()
         if not use_ent:
             losses["ent"] = losses["ent"].detach()
         if not use_corr:
@@ -384,7 +389,8 @@ def correlation(qs, apply_softmax=True, corr=True):
 
     return sum_corr
 
-def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
+def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args):
+    log_per_step = 10000
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4f')
@@ -397,18 +403,19 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
     model.train()
 
     end = time.time()
-    for i, (images, _) in enumerate(train_loader):
+    for i, (images, ys) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         if args.gpu is not None:
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
+            ys = ys.cuda(args.gpu, non_blocking=True)
 
         # compute output and loss
         p1, p2, z1, z2, gs = model(x1=images[0], x2=images[1])
-        losses = criterion(p1, p2, z1, z2, gs)
-        loss = - losses["cossim"] + losses["corr"] - losses["memax"] - losses["ent"]
+        loss_dict = criterion(p1, p2, z1, z2, gs)
+        loss = - loss_dict["cossim"] + loss_dict["corr"] - loss_dict["memax"] - loss_dict["ent"]
         losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
@@ -416,18 +423,24 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, args):
         loss.backward()
         optimizer.step()
 
+        # evaluate
+        ys = ys.repeat(2)
+        evaluate = tb_logger.need_log(log_per_step)
+        metrics = evaluator(torch.cat([z1, z2]), ys, evaluate=evaluate)
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
         if i % args.print_freq == 0:
             progress.display(i)
-
-        tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
-        tb_logger.add_scalar(tag="train/sim", scalar_value=losses["cossim"].item())
-        tb_logger.add_scalar(tag="train/memax", scalar_value=losses["memax"].item())
-        tb_logger.add_scalar(tag="train/corr", scalar_value=losses["corr"].item())
-        tb_logger.add_scalar(tag="train/ent", scalar_value=losses["ent"].item())
+        if tb_logger.need_log(log_per_step):
+            tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
+            tb_logger.add_scalar(tag="train/sim", scalar_value=loss_dict["cossim"].item())
+            tb_logger.add_scalar(tag="train/memax", scalar_value=loss_dict["memax"].item())
+            tb_logger.add_scalar(tag="train/corr", scalar_value=loss_dict["corr"].item())
+            tb_logger.add_scalar(tag="train/ent", scalar_value=loss_dict["ent"].item())
+            for key, value in metrics.items():
+                tb_logger.add_scalar(tag=f"train/{key}", scalar_value=value.item())
         tb_logger.step()
 
 
