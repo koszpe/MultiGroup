@@ -376,7 +376,6 @@ softm = torch.nn.Softmax(dim=-1)
 def correlation(qs, apply_softmax=True, corr=True):
     sum_corr = 0
     for q in qs:
-        q = q.clone().double()
         if apply_softmax:
             q = softm(q)
         q = q - q.mean(dim=1, keepdim=True)
