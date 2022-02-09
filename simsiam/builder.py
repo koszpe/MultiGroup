@@ -36,7 +36,8 @@ class SimSiam(nn.Module):
                                         nn.BatchNorm1d(prev_dim),
                                         nn.ReLU(inplace=True), # second layer
                                         self.encoder.fc,
-                                        nn.BatchNorm1d(dim, affine=False)) # output layer
+                                        nn.BatchNorm1d(dim, affine=False) # output layer
+                                        )
         self.encoder.fc[6].bias.requires_grad = False # hack: not use bias as it is followed by BN
 
         # build a 2-layer predictor
@@ -64,7 +65,7 @@ class SimSiam(nn.Module):
         p1 = self.predictor(z1) # NxC
         p2 = self.predictor(z2) # NxC
 
-        return p1, p2, z1.detach(), z2.detach()
+        return p1, p2, z1, z2
 
 class MultiGroup(SimSiam):
 
@@ -82,6 +83,7 @@ class MultiGroup(SimSiam):
     def forward(self, x1, x2):
         p1, p2, z1, z2 = super(MultiGroup, self).forward(x1, x2)
         gs = []
+        # p = torch.cat([z1, z2])
         p = torch.cat([p1, p2])
         groups = self.group_head(p)
         groups = AllGather.apply(groups)
@@ -89,4 +91,4 @@ class MultiGroup(SimSiam):
         for g_slice, g_size, g_num in zip(self.group_slices, self.group_sizes, self.group_nums):
             group = groups[:, g_slice].view(bs, g_num, g_size).permute(1, 0, 2).contiguous() # group_num x batch_size x group_size
             gs.append(group)
-        return p1, p2, z1, z2, gs
+        return p1, p2, z1.detach(), z2.detach(), gs
