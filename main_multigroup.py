@@ -376,7 +376,6 @@ softm = torch.nn.Softmax(dim=-1)
 def correlation(qs, apply_softmax=True, corr=True):
     sum_corr = 0
     for q in qs:
-        q = q.clone().double()
         if apply_softmax:
             q = softm(q)
         q = q - q.mean(dim=1, keepdim=True)
@@ -415,7 +414,7 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
         # compute output and loss
         p1, p2, z1, z2, gs = model(x1=images[0], x2=images[1])
         loss_dict = criterion(p1, p2, z1, z2, gs)
-        loss = - loss_dict["cossim"] + loss_dict["corr"] - loss_dict["memax"] - loss_dict["ent"]
+        loss = - loss_dict["cossim"] + loss_dict["corr"] - loss_dict["memax"] + loss_dict["ent"]
         losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
