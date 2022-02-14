@@ -20,3 +20,5 @@ WORKDIR /workspace
 COPY entry.sh /entry.sh
 RUN chmod +x /entry.sh
 ENTRYPOINT ["/entry.sh"]
+
+RUN pip install ssl_eval
