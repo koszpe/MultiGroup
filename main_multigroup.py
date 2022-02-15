@@ -175,11 +175,15 @@ def main_worker(gpu, ngpus_per_node, args):
         models.__dict__[args.arch],
         args.dim, args.pred_dim)
 
-    evaluator = Evaluator(model.encoder, 2048, "imagenet", args.data, args.batch_size)
-
     # infer learning rate before changing batch size
     init_lr = args.lr * args.batch_size / 256
-
+    if args.distributed and args.gpu is not None:
+        # When using a single GPU per process and per
+        # DistributedDataParallel, we need to divide the batch size
+        # ourselves based on the total number of GPUs we have
+        args.batch_size = int(args.batch_size / ngpus_per_node)
+        args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+    evaluator = Evaluator(model.encoder, 2048, "imagenet", args.data, args.batch_size)
     if args.distributed:
         # Apply SyncBN
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -189,11 +193,6 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
-            # When using a single GPU per process and per
-            # DistributedDataParallel, we need to divide the batch size
-            # ourselves based on the total number of GPUs we have
-            args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
@@ -390,6 +389,7 @@ def correlation(qs, apply_softmax=True, corr=True):
 def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args):
     log_per_step = 10000
     evaluate_per_epoch = 1
+    main_rank = not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank == 0)
     evaluate_per_step = evaluate_per_epoch * len(train_loader.dataset)
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
@@ -422,17 +422,20 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
         loss.backward()
         optimizer.step()
 
-        # evaluate
-        evaluate = tb_logger.need_log(evaluate_per_step)
-        if evaluate and tb_logger.global_step > 0:
-            init_lr = args.lr * args.batch_size / 256
-            z, y = evaluator.generate_embeddings(flip=True)
-            accuracy = evaluator.linear_eval(z, y, epochs=100, batch_size=args.batch_size, lr=init_lr)
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank == 0):
+        # evaluate
+        evaluate = tb_logger.need_log(evaluate_per_step) # and tb_logger.global_step > 0
+        if evaluate:
+            init_lr = args.lr * args.batch_size / 256
+            z, y = evaluator.generate_embeddings(n_views=1)
+            accuracy = evaluator.linear_eval(z, y, epochs=100, batch_size=args.batch_size, lr=init_lr)
+            if main_rank:
+                tb_logger.add_scalar(tag="test/accuracy", scalar_value=accuracy)
+
+        if main_rank:
             if i % args.print_freq == 0:
                 progress.display(i)
             if tb_logger.need_log(log_per_step):
@@ -441,8 +444,6 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
                 tb_logger.add_scalar(tag="train/memax", scalar_value=loss_dict["memax"].item())
                 tb_logger.add_scalar(tag="train/corr", scalar_value=loss_dict["corr"].item())
                 tb_logger.add_scalar(tag="train/ent", scalar_value=loss_dict["ent"].item())
-            if evaluate:
-                tb_logger.add_scalar(tag="test/accuracy", scalar_value=accuracy)
         tb_logger.step()
 
 
