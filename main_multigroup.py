@@ -389,7 +389,7 @@ def correlation(qs, apply_softmax=True, corr=True):
 def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args):
     log_per_step = 10000
     evaluate_per_epoch = 1
-    main_rank = not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank == 0)
+    main_rank = not args.multiprocessing_distributed or args.rank == 0
     evaluate_per_step = evaluate_per_epoch * len(train_loader.dataset)
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
@@ -427,13 +427,13 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
         end = time.time()
 
         # evaluate
-        evaluate = tb_logger.need_log(evaluate_per_step) # and tb_logger.global_step > 0
+        evaluate = tb_logger.need_log(evaluate_per_step) and tb_logger.global_step > 0
         if evaluate:
             init_lr = args.lr * args.batch_size / 256
             z, y = evaluator.generate_embeddings(n_views=1)
             accuracy = evaluator.linear_eval(z, y, epochs=100, batch_size=args.batch_size, lr=init_lr)
             if main_rank:
-                tb_logger.add_scalar(tag="test/accuracy", scalar_value=accuracy)
+                tb_logger.add_scalar(tag="test/accuracy", scalar_value=accuracy.item())
 
         if main_rank:
             if i % args.print_freq == 0:
