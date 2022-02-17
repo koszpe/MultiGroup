@@ -14,6 +14,8 @@ RUN echo "%docker  ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/inside_sudoers
 
 RUN pip install tqdm dotmap matplotlib opencv-python pandas numpy jupyter sklearn tensorboard pudb pkbar
 
+RUN pip install ssl_eval
+
 ENV PYTHONPATH=/workspace
 WORKDIR /workspace
 

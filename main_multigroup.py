@@ -29,7 +29,7 @@ import torchvision.models as models
 
 import simsiam.loader
 import simsiam.builder
-from evaluator import SnnEvaluator
+from ssl_eval.eval import Evaluator
 from mp_utils import AllReduce, AllGather
 from simsiam.logger import TBLogger
 
@@ -175,11 +175,15 @@ def main_worker(gpu, ngpus_per_node, args):
         models.__dict__[args.arch],
         args.dim, args.pred_dim)
 
-    evaluator = SnnEvaluator(dim=args.dim, n_classes=1000, max_queue_size=10)
-
     # infer learning rate before changing batch size
     init_lr = args.lr * args.batch_size / 256
-
+    if args.distributed and args.gpu is not None:
+        # When using a single GPU per process and per
+        # DistributedDataParallel, we need to divide the batch size
+        # ourselves based on the total number of GPUs we have
+        args.batch_size = int(args.batch_size / ngpus_per_node)
+        args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+    evaluator = Evaluator(model.encoder, 2048, "imagenet", args.data, args.batch_size)
     if args.distributed:
         # Apply SyncBN
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -189,23 +193,15 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.gpu is not None:
             torch.cuda.set_device(args.gpu)
             model.cuda(args.gpu)
-            evaluator.cuda(args.gpu)
-            # When using a single GPU per process and per
-            # DistributedDataParallel, we need to divide the batch size
-            # ourselves based on the total number of GPUs we have
-            args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
-            evaluator.cuda()
             # DistributedDataParallel will divide and allocate batch_size to all
             # available GPUs if device_ids are not set
             model = torch.nn.parallel.DistributedDataParallel(model)
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
-        evaluator = evaluator.cuda(args.gpu)
         # comment out the following line for debugging
         # raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
@@ -302,13 +298,15 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args)
 
         if (epoch + 1) % args.save_frequency == 0 or epoch == 0:
-            filename = os.path.join(folder, 'checkpoint_{:04d}.pt'.format(epoch+1))
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename=filename)
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                        and args.rank % ngpus_per_node == 0):
+                filename = os.path.join(folder, 'checkpoint_{:04d}.pt'.format(epoch+1))
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'optimizer' : optimizer.state_dict(),
+                }, is_best=False, filename=filename)
 
 
 def sharpen(p, T=0.25):
@@ -390,6 +388,9 @@ def correlation(qs, apply_softmax=True, corr=True):
 
 def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args):
     log_per_step = 10000
+    evaluate_per_epoch = 1
+    main_rank = not args.multiprocessing_distributed or args.rank == 0
+    evaluate_per_step = evaluate_per_epoch * len(train_loader.dataset)
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4f')
@@ -402,14 +403,13 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
     model.train()
 
     end = time.time()
-    for i, (images, ys) in enumerate(train_loader):
+    for i, (images, _) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         if args.gpu is not None:
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
-            ys = ys.cuda(args.gpu, non_blocking=True)
 
         # compute output and loss
         p1, p2, z1, z2, gs = model(x1=images[0], x2=images[1])
@@ -422,24 +422,28 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
         loss.backward()
         optimizer.step()
 
-        # evaluate
-        ys = ys.repeat(2)
-        evaluate = tb_logger.need_log(log_per_step)
-        metrics = evaluator(torch.cat([z1, z2]), ys, evaluate=evaluate)
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            progress.display(i)
-        if tb_logger.need_log(log_per_step):
-            tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
-            tb_logger.add_scalar(tag="train/sim", scalar_value=loss_dict["cossim"].item())
-            tb_logger.add_scalar(tag="train/memax", scalar_value=loss_dict["memax"].item())
-            tb_logger.add_scalar(tag="train/corr", scalar_value=loss_dict["corr"].item())
-            tb_logger.add_scalar(tag="train/ent", scalar_value=loss_dict["ent"].item())
-            for key, value in metrics.items():
-                tb_logger.add_scalar(tag=f"train/{key}", scalar_value=value.item())
+        # evaluate
+        evaluate = tb_logger.need_log(evaluate_per_step) and tb_logger.global_step > 0
+        if evaluate:
+            init_lr = args.lr * args.batch_size / 256
+            z, y = evaluator.generate_embeddings(n_views=1)
+            accuracy = evaluator.linear_eval(z, y, epochs=100, batch_size=args.batch_size, lr=init_lr)
+            if main_rank:
+                tb_logger.add_scalar(tag="test/accuracy", scalar_value=accuracy.item())
+
+        if main_rank:
+            if i % args.print_freq == 0:
+                progress.display(i)
+            if tb_logger.need_log(log_per_step):
+                tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
+                tb_logger.add_scalar(tag="train/sim", scalar_value=loss_dict["cossim"].item())
+                tb_logger.add_scalar(tag="train/memax", scalar_value=loss_dict["memax"].item())
+                tb_logger.add_scalar(tag="train/corr", scalar_value=loss_dict["corr"].item())
+                tb_logger.add_scalar(tag="train/ent", scalar_value=loss_dict["ent"].item())
         tb_logger.step()
 
 
