@@ -98,8 +98,7 @@ parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
-parser.add_argument("--group-sizes", default=[2, 16, 32, 64], type=int, nargs="+", help="Size of the groups to create")
-parser.add_argument("--group-nums", default= [16, 8,  4,  4], type=int, nargs="+", help="Num of the grous")
+parser.add_argument("--bottleneck-dims", default=[2, 16, 64, 256, 512, 1024, 2048], type=int, nargs="+", help="Size of the groups to create")
 parser.add_argument('--no-cossim', action='store_false', dest="use_cossim",
                     help='Fix learning rate for the predictor')
 parser.add_argument('--no-corr', action='store_false', dest="use_corr",
@@ -168,9 +167,8 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.distributed.barrier()
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = simsiam.builder.MultiGroup(
-        args.group_sizes,
-        args.group_nums,
+    model = simsiam.builder.MultiPredictorSimSiam(
+        args.bottleneck_dims,
         models.__dict__[args.arch],
         args.dim, args.pred_dim)
 
@@ -210,12 +208,7 @@ def main_worker(gpu, ngpus_per_node, args):
     print(model) # print model after SyncBatchNorm
 
     # define loss function (criterion) and optimizer
-    criterion = create_loss(
-        use_cossim=args.use_cossim,
-        use_corr=args.use_corr,
-        use_memax=args.use_memax,
-        use_ent=args.use_ent,
-    )
+    criterion = create_loss()
 
     if args.fix_pred_lr:
         optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
@@ -307,83 +300,14 @@ def main_worker(gpu, ngpus_per_node, args):
                     'optimizer' : optimizer.state_dict(),
                 }, is_best=False, filename=filename)
 
-
-def sharpen(p, T=0.25):
-    sharp_p = p**(1./T)
-    sharp_p /= torch.sum(sharp_p, dim=1, keepdim=True)
-    return sharp_p
-
-sm = torch.nn.Softmax(dim=1)
-def softmax(x):
-    return sm(x - x.max(dim=1, keepdim=True)[0])
-
-def crossentropy(ps, qs):
-    loss_count = 0
-    sum_loss = 0
-    for ss_ps, ss_qs in zip(ps, qs):
-        for p, q in zip(ss_ps, ss_qs):
-            p = softmax(p)
-            # p[p<1-4] = 0
-            # p = sharpen(p)
-            q = softmax(q)
-            sum_loss -= torch.sum(p * torch.log(q+1e-6)) / len(p)
-            loss_count += 1
-    return sum_loss / loss_count
-
-def entropy(ps):
-    loss_count = 0
-    sum_loss = 0
-    for ss_ps in ps:
-        for p in ss_ps:
-            p = softmax(p)
-            sum_loss -= torch.sum(p * torch.log(p+1e-6)) / len(p)
-            loss_count += 1
-    return sum_loss / loss_count
-
-def me_max(qs):
-    loss_count = 0
-    sum_loss = 0
-    for ss_qs in qs:
-        for q in ss_qs:
-            avg_probs = torch.mean(softmax(q), dim=0)
-            sum_loss -= torch.sum(avg_probs * torch.log(avg_probs + 1e-6))
-            loss_count += 1
-    return sum_loss / loss_count
-
-def create_loss(use_cossim, use_ent, use_corr, use_memax):
+def create_loss():
     cossim = nn.CosineSimilarity(dim=1)
-    def compute_all_loss(p1, p2, z1, z2, gs):
+    def compute_all_loss(p1s, p2s, z1, z2):
         losses = dict()
-        losses["cossim"] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
-        losses["memax"] = me_max(gs)
-        losses["corr"] = correlation(gs, apply_softmax=False, corr=True)
-        losses["ent"] = entropy(gs)
-        if not use_cossim:
-            losses["cossim"] = losses["cossim"].detach()
-        if not use_ent:
-            losses["ent"] = losses["ent"].detach()
-        if not use_corr:
-            losses["corr"] = losses["corr"].detach()
-        if not use_memax:
-            losses["memax"] = losses["memax"].detach()
+        for i, ((bn_dim, p1), p2) in enumerate(zip(p1s.items(), p2s.values())):
+            losses[f"cossim_{bn_dim}"] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
         return losses
     return compute_all_loss
-
-softm = torch.nn.Softmax(dim=-1)
-def correlation(qs, apply_softmax=True, corr=True):
-    sum_corr = 0
-    for q in qs:
-        if apply_softmax:
-            q = softm(q)
-        q = q - q.mean(dim=1, keepdim=True)
-        if corr:
-            q = q / q.std(dim=1, keepdim=True)
-        tril_indices = torch.tril_indices(q.shape[0], q.shape[1], offset=-1)
-        corr_m = torch.einsum("nbi,mbj->nmij", q, q) / (q.shape[1] - 1)
-        sum_corr += corr_m[tril_indices[0], tril_indices[1], :, :].abs().mean()
-    sum_corr /= len(qs)
-
-    return sum_corr
 
 def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args):
     log_per_step = 10000
@@ -411,9 +335,15 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
 
         # compute output and loss
-        p1, p2, z1, z2, gs = model(x1=images[0], x2=images[1])
-        loss_dict = criterion(p1, p2, z1, z2, gs)
-        loss = - loss_dict["cossim"] + loss_dict["corr"] - loss_dict["memax"] + loss_dict["ent"]
+        p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
+        loss_dict = criterion(p1, p2, z1, z2)
+        loss = .0
+        for k, v in loss_dict.items():
+            loss -= v
+            if main_rank and tb_logger.need_log(log_per_step):
+                tb_logger.add_scalar(tag=f"train/{k}", scalar_value=v.item())
+        if main_rank and tb_logger.need_log(log_per_step):
+            tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
         losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
@@ -434,15 +364,8 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
             if main_rank:
                 tb_logger.add_scalar(tag="test/accuracy", scalar_value=accuracy.item())
 
-        if main_rank:
-            if i % args.print_freq == 0:
-                progress.display(i)
-            if tb_logger.need_log(log_per_step):
-                tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
-                tb_logger.add_scalar(tag="train/sim", scalar_value=loss_dict["cossim"].item())
-                tb_logger.add_scalar(tag="train/memax", scalar_value=loss_dict["memax"].item())
-                tb_logger.add_scalar(tag="train/corr", scalar_value=loss_dict["corr"].item())
-                tb_logger.add_scalar(tag="train/ent", scalar_value=loss_dict["ent"].item())
+        if main_rank and i % args.print_freq == 0:
+            progress.display(i)
         tb_logger.step()
 
 
