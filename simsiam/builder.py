@@ -85,7 +85,7 @@ class MultiGroup(SimSiam):
         gs = []
         # p = torch.cat([z1, z2])
         p = torch.cat([p1, p2])
-        groups = self.group_head(p.detach())
+        groups = self.group_head(p)
         groups = AllGather.apply(groups)
         bs = groups.shape[0]
         for g_slice, g_size, g_num in zip(self.group_slices, self.group_sizes, self.group_nums):
