@@ -176,13 +176,14 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # infer learning rate before changing batch size
     init_lr = args.lr * args.batch_size / 256
+    eval_init_lr = 1.0
     if args.distributed and args.gpu is not None:
         # When using a single GPU per process and per
         # DistributedDataParallel, we need to divide the batch size
         # ourselves based on the total number of GPUs we have
         args.batch_size = int(args.batch_size / ngpus_per_node)
         args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-    evaluator = Evaluator(model.encoder, 2048, "imagenet", args.data, args.batch_size)
+    evaluator = Evaluator(model.encoder, "imagenet", args.data, args.batch_size)
     if args.distributed:
         # Apply SyncBN
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -294,7 +295,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # train for one epoch
         # with torch.autograd.set_detect_anomaly(True):
-        train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args)
+        train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args)
 
         if (epoch + 1) % args.save_frequency == 0 or epoch == 0:
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed
@@ -385,7 +386,7 @@ def correlation(qs, apply_softmax=True, corr=True):
 
     return sum_corr
 
-def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args):
+def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args):
     log_per_step = 10000
     evaluate_per_epoch = 5
     main_rank = not args.multiprocessing_distributed or args.rank == 0
@@ -428,9 +429,8 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
         # evaluate
         evaluate = tb_logger.need_log(evaluate_per_step) and tb_logger.global_step > 0
         if evaluate:
-            init_lr = args.lr * args.batch_size / 256
             z, y = evaluator.generate_embeddings(n_views=1)
-            accuracy = evaluator.linear_eval(z, y, epochs=100, batch_size=args.batch_size, lr=init_lr)
+            accuracy = evaluator.linear_eval(z, y, epochs=100, batch_size=args.batch_size, lr=eval_init_lr)
             if main_rank:
                 tb_logger.add_scalar(tag="test/accuracy", scalar_value=accuracy.item())
 

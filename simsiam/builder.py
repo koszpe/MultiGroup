@@ -95,17 +95,45 @@ class MultiGroup(SimSiam):
 
 class MultiPredictor(nn.Module):
 
-    def __init__(self, dim, bottleneck_dims):
+    def __init__(self, dim, bottleneck_dims, init_dop=0.5, min_dop=0, max_dop=0.9, dop_step=0.01):
         super().__init__()
         self.predictors = dict()
+        self.init_dop = init_dop
+        self.min_dop = min_dop
+        self.max_dop = max_dop
+        self.dop_step = dop_step
         assert len(set(bottleneck_dims)) == len(bottleneck_dims), "all bottleneck_dims must be unique"
         for bn_dim in bottleneck_dims:
             predictor = nn.Sequential(nn.Linear(dim, bn_dim, bias=False),
-                                           nn.BatchNorm1d(bn_dim),
-                                           nn.ReLU(inplace=True),  # hidden layer
-                                           nn.Linear(bn_dim, dim))  # output layer
+                                      nn.BatchNorm1d(bn_dim),
+                                      nn.ReLU(inplace=True),  # hidden layer
+                                      nn.Dropout(p=self.init_dop),
+                                      nn.Linear(bn_dim, dim))  # output layer
             setattr(self, f"predictor_{bn_dim}", predictor)
             self.predictors[bn_dim] = predictor
+
+    def set_dropout_p(self, p):
+        self.init_dop = p
+        for predictor in self.predictors.values():
+            for module in predictor.modules():
+                if type(module) is nn.Dropout:
+                    module.p = p
+
+    def increase_dropout_p(self, dim):
+        for module in self.predictors[dim].modules():
+            if type(module) is nn.Dropout:
+                if module.p + self.dop_step < self.max_dop:
+                    module.p += self.dop_step
+                    return module.p
+        return None
+
+    def decrease_dropout_p(self, dim):
+        for module in self.predictors[dim].modules():
+            if type(module) is nn.Dropout:
+                if module.p - self.dop_step > self.min_dop:
+                    module.p -= self.dop_step
+                    return module.p
+        return None
 
     def forward(self, x):
         outs = dict()
@@ -114,10 +142,10 @@ class MultiPredictor(nn.Module):
         return outs
 
 class MultiPredictorSimSiam(SimSiam):
-    def __init__(self, bottleneck_dims, *args, **kwargs):
+    def __init__(self, bottleneck_dims, init_dop, min_dop, max_dop, dop_step, *args, **kwargs):
         super(MultiPredictorSimSiam, self).__init__(*args, **kwargs)
         self.bottleneck_dims = bottleneck_dims
-        self.predictor = MultiPredictor(self.dim, bottleneck_dims)
+        self.predictor = MultiPredictor(self.dim, bottleneck_dims, init_dop, min_dop, max_dop, dop_step)
 
     def forward(self, x1, x2):
         p1, p2, z1, z2 = super(MultiPredictorSimSiam, self).forward(x1, x2)

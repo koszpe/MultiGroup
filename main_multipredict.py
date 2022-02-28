@@ -168,19 +168,22 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = simsiam.builder.MultiPredictorSimSiam(
-        args.bottleneck_dims,
+        args.bottleneck_dims, 0.0,  0.0,  0.9,  0.01,
         models.__dict__[args.arch],
         args.dim, args.pred_dim)
 
+    multi_predictor = model.predictor
+
     # infer learning rate before changing batch size
     init_lr = args.lr * args.batch_size / 256
+    eval_init_lr = 1.0
     if args.distributed and args.gpu is not None:
         # When using a single GPU per process and per
         # DistributedDataParallel, we need to divide the batch size
         # ourselves based on the total number of GPUs we have
         args.batch_size = int(args.batch_size / ngpus_per_node)
         args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-    evaluator = Evaluator(model.encoder, 2048, "imagenet", args.data, args.batch_size)
+    evaluator = Evaluator(model.encoder, "imagenet", args.data, args.batch_size)
     if args.distributed:
         # Apply SyncBN
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -287,7 +290,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # train for one epoch
         # with torch.autograd.set_detect_anomaly(True):
-        train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args)
+        train(train_loader, model, multi_predictor, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args)
 
         if (epoch + 1) % args.save_frequency == 0 or epoch == 0:
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed
@@ -300,16 +303,52 @@ def main_worker(gpu, ngpus_per_node, args):
                     'optimizer' : optimizer.state_dict(),
                 }, is_best=False, filename=filename)
 
+def Normalize(inverse=False, dim=1):
+    def normalize(x):
+        norm = torch.norm(x, p=2, dim=dim, keepdim=True)
+        norm = torch.clamp(norm, 1e-12)
+        if inverse:
+            x = InverseBackpropDivide.apply(x, norm)
+        else:
+            x = x / norm
+        return x
+    return normalize
+
+def CosineSimilarity_(inverse=False):
+    normalize = Normalize(inverse)
+    def cosine_similarioty(x1, x2):
+        x1 = normalize(x1)
+        x2 = normalize(x2)
+        return x1 @ x2.T
+    return cosine_similarioty
+
+def CosineSimilarity(inverse=False):
+    if inverse:
+        normalize = InverseBackpropNormalize.apply
+    else:
+        normalize = torch.nn.functional.normalize
+    normalize = Normalize(inverse)
+    def cosine_similarioty(x1, x2):
+        x1 = normalize(x1)
+        x2 = normalize(x2)
+        return x1 @ x2.T
+    return cosine_similarioty
+
 def create_loss():
-    cossim = nn.CosineSimilarity(dim=1)
+    # cossim = CosineSimilarity(inverse=True)
+    cossim = torch.nn.CosineSimilarity(dim=1)
     def compute_all_loss(p1s, p2s, z1, z2):
         losses = dict()
         for i, ((bn_dim, p1), p2) in enumerate(zip(p1s.items(), p2s.values())):
-            losses[f"cossim_{bn_dim}"] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
+            p1 = ScaleGrad.apply(p1)
+            p2 = ScaleGrad.apply(p2)
+            z1 = ScaleGrad.apply(z1)
+            z2 = ScaleGrad.apply(z2)
+            losses[bn_dim] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
         return losses
     return compute_all_loss
 
-def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator, args):
+def train(train_loader, model, multi_predictor, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args):
     log_per_step = 10000
     evaluate_per_epoch = 5
     main_rank = not args.multiprocessing_distributed or args.rank == 0
@@ -337,13 +376,27 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
         # compute output and loss
         p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
         loss_dict = criterion(p1, p2, z1, z2)
+        if False:
+            for bn_dim, cossim in loss_dict.items():
+                new_p = None
+                if cossim <= 0.8:
+                    new_p = multi_predictor.decrease_dropout_p(bn_dim)
+                if cossim >= 0.85:
+                    new_p = multi_predictor.increase_dropout_p(bn_dim)
+                if main_rank and new_p is not None:
+                    tb_logger.add_scalar(tag=f"train/dropout_p_{bn_dim}", scalar_value=new_p)
+
         loss = .0
-        for k, v in loss_dict.items():
-            loss -= v
+        for bn_dim, cossim in loss_dict.items():
+            loss -= cossim
             if main_rank and tb_logger.need_log(log_per_step):
-                tb_logger.add_scalar(tag=f"train/{k}", scalar_value=v.item())
+                tb_logger.add_scalar(tag=f"train/cossim_{bn_dim}", scalar_value=cossim.item())
         if main_rank and tb_logger.need_log(log_per_step):
             tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
+            for bn_dim, cossim in loss_dict.items():
+                tb_logger.log_describe(f"stats/p_len_{bn_dim}", torch.cat([p1[bn_dim], p2[bn_dim]]).detach().norm(dim=-1))
+                tb_logger.log_describe(f"stats/z_len", torch.cat([z1, z2]).detach().norm(dim=-1))
+
         losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
@@ -358,9 +411,8 @@ def train(train_loader, model, criterion, optimizer, epoch, tb_logger, evaluator
         # evaluate
         evaluate = tb_logger.need_log(evaluate_per_step) and tb_logger.global_step > 0
         if evaluate:
-            init_lr = args.lr * args.batch_size / 256
-            z, y = evaluator.generate_embeddings(n_views=1)
-            accuracy = evaluator.linear_eval(z, y, epochs=100, batch_size=args.batch_size, lr=init_lr)
+            embeddings = evaluator.generate_embeddings(n_views=1)
+            accuracy = evaluator.linear_eval(*embeddings, epochs=100, batch_size=args.batch_size, lr=eval_init_lr)
             if main_rank:
                 tb_logger.add_scalar(tag="test/accuracy", scalar_value=accuracy.item())
 
@@ -424,6 +476,43 @@ def adjust_learning_rate(optimizer, init_lr, epoch, args):
             param_group['lr'] = init_lr
         else:
             param_group['lr'] = cur_lr
+
+
+class InverseBackpropNormalize(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, i, dim=1):
+        norm = torch.norm(i, p=2, dim=dim, keepdim=True)
+        norm = torch.clamp(norm, 1e-12)
+        ctx.save_for_backward(norm)
+        return i / norm
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        norm, = ctx.saved_tensors
+        return grad_output
+
+class InverseBackpropDivide(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, numerator, denominator):
+        ctx.save_for_backward(numerator, denominator)
+        return numerator / denominator
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        numerator, denominator, = ctx.saved_tensors
+        return grad_output / denominator, - grad_output * numerator / denominator ** 2
+
+class ScaleGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        norm = torch.norm(x, p=2, dim=1, keepdim=True)
+        ctx.save_for_backward(norm)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        norm, = ctx.saved_tensors
+        return grad_output * norm ** 2 / norm.mean() ** 2
 
 
 if __name__ == '__main__':
