@@ -109,6 +109,7 @@ class MultiPredictor(nn.Module):
                                       nn.ReLU(inplace=True),  # hidden layer
                                       nn.Dropout(p=self.init_dop),
                                       nn.Linear(bn_dim, dim))  # output layer
+            # predictor = lambda x: torch.scatter(x, -1, torch.topk(x, dim - bn_dim, dim=-1, largest=False, sorted=False)[1], 0)
             setattr(self, f"predictor_{bn_dim}", predictor)
             self.predictors[bn_dim] = predictor
 
@@ -149,4 +150,26 @@ class MultiPredictorSimSiam(SimSiam):
 
     def forward(self, x1, x2):
         p1, p2, z1, z2 = super(MultiPredictorSimSiam, self).forward(x1, x2)
+
+        return p1, p2, z1, z2
+
+class DoublePredHead(SimSiam):
+    def __init__(self, pred_type, *args, **kwargs):
+        super(DoublePredHead, self).__init__(*args, **kwargs)
+        self.pred_type = pred_type
+        del self.predictor
+        self.predictor = lambda x: x  # Replace original predictor with identity fn
+        if pred_type in ["linear", "random_linear"]:
+            self.double_predictor = nn.Linear(self.dim, self.pred_dim, bias=False)
+        else:
+            raise NotImplementedError
+
+    def forward(self, x1, x2):
+        p1, p2, z1, z2 = super(DoublePredHead, self).forward(x1, x2)
+        if self.pred_type == "random_linear":
+            self.double_predictor.reset_parameters()
+        all = self.double_predictor(torch.cat([p1, p2, z1, z2]))
+        p1, p2, z1, z2 = torch.chunk(all, 4)
+        p1 = {self.pred_dim: p1}
+        p2 = {self.pred_dim: p2}
         return p1, p2, z1.detach(), z2.detach()

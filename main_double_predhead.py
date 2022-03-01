@@ -98,15 +98,8 @@ parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
-parser.add_argument("--bottleneck-dims", default=[2, 16, 64, 256, 512, 1024, 2048], type=int, nargs="+", help="Size of the groups to create")
-parser.add_argument('--no-cossim', action='store_false', dest="use_cossim",
-                    help='Fix learning rate for the predictor')
-parser.add_argument('--no-corr', action='store_false', dest="use_corr",
-                    help='Fix learning rate for the predictor')
-parser.add_argument('--no-memax', action='store_false', dest="use_memax",
-                    help='Fix learning rate for the predictor')
-parser.add_argument('--no-entropy', action='store_false', dest="use_ent",
-                    help='Fix learning rate for the predictor')
+parser.add_argument("--pred-type", default="linear", help="type of the prediction head", choices=["linear", "random_linear"])
+
 
 def main():
     args = parser.parse_args()
@@ -167,8 +160,8 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.distributed.barrier()
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = simsiam.builder.MultiPredictorSimSiam(
-        args.bottleneck_dims, 0.0,  0.0,  0.9,  0.01,
+    model = simsiam.builder.DoublePredHead(
+        args.pred_type,
         models.__dict__[args.arch],
         args.dim, args.pred_dim)
 
@@ -215,8 +208,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     if args.fix_pred_lr:
         optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
-                        {'params': model.module.predictor.parameters(), 'fix_lr': True}]
-        # optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False}]
+                        {'params': model.module.double_predictor.parameters(), 'fix_lr': True}]
     else:
         optim_params = model.parameters()
 
