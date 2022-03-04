@@ -163,6 +163,7 @@ class DoublePredHead(SimSiam):
             self.double_predictor = nn.Linear(self.dim, self.pred_dim, bias=False)
         else:
             raise NotImplementedError
+        self.bn = nn.BatchNorm1d(self.pred_dim, affine=False)
 
     def forward(self, x1, x2):
         p1, p2, z1, z2 = super(DoublePredHead, self).forward(x1, x2)
@@ -170,6 +171,8 @@ class DoublePredHead(SimSiam):
             self.double_predictor.reset_parameters()
         all = self.double_predictor(torch.cat([p1, p2, z1, z2]))
         p1, p2, z1, z2 = torch.chunk(all, 4)
+        z1 = self.bn(z1)
+        z2 = self.bn(z2)
         p1 = {self.pred_dim: p1}
         p2 = {self.pred_dim: p2}
         return p1, p2, z1.detach(), z2.detach()
