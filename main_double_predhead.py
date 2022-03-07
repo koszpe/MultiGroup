@@ -98,7 +98,7 @@ parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
-parser.add_argument("--pred-type", default="linear", help="type of the prediction head", choices=["linear", "random_linear"])
+parser.add_argument("--pred-type", default="linear", help="type of the prediction head", choices=["linear", "random_linear", "predefined_linear"])
 
 
 def main():
@@ -160,7 +160,12 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.distributed.barrier()
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = simsiam.builder.DoublePredHead(
+    # model = simsiam.builder.DoublePredHead(
+    #     args.pred_type,
+    #     models.__dict__[args.arch],
+    #     args.dim, args.pred_dim)
+
+    model = simsiam.builder.PredefinedPredictor(
         args.pred_type,
         models.__dict__[args.arch],
         args.dim, args.pred_dim)

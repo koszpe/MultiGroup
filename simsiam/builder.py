@@ -3,9 +3,13 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+import os
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
+from torch import device
+from torch.nn.modules.module import T
 
 from mp_utils import AllGather
 
@@ -176,3 +180,30 @@ class DoublePredHead(SimSiam):
         p1 = {self.pred_dim: p1}
         p2 = {self.pred_dim: p2}
         return p1, p2, z1.detach(), z2.detach()
+
+
+class PredefinedPredictor(SimSiam):
+    def __init__(self, pred_type, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pred_type = pred_type
+        if pred_type == "predefined_linear":
+            del self.predictor
+            predictor = [nn.Linear(self.dim, self.pred_dim, bias=False),
+                         nn.Linear(self.pred_dim, self.dim)]
+            root_path = "/storage/simsiam/logs/original_nobnnorelupredhead_384bs_512/"
+            epoch = "0050"
+            checkpoint_path = os.path.join(root_path, f"checkpoint_{epoch}.pt")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            predictor[0].weight.data.copy_(checkpoint['state_dict']['module.predictor.predictor_512.0.weight'])
+            predictor[1].weight.data.copy_(checkpoint['state_dict']['module.predictor.predictor_512.1.weight'])
+            predictor[1].bias.data.copy_(checkpoint['state_dict']['module.predictor.predictor_512.1.bias'])
+            self.predictor = lambda x: {512: predictor[1](predictor[0](x)) + torch.normal(torch.zeros_like(x), torch.ones_like(x) * 0.001)}
+            self.predictor_list = predictor
+        else:
+            raise NotImplementedError
+
+    def cuda(self: T, device: Optional[Union[int, device]] = None) -> T:
+        self.predictor_list[0].cuda(device)
+        self.predictor_list[1].cuda(device)
+        return super().cuda(device)
+
