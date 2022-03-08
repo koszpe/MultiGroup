@@ -340,10 +340,10 @@ def create_loss():
     def compute_all_loss(p1s, p2s, z1, z2):
         losses = dict()
         for i, ((bn_dim, p1), p2) in enumerate(zip(p1s.items(), p2s.values())):
-            # p1 = ScaleGrad.apply(p1)
-            # p2 = ScaleGrad.apply(p2)
-            # z1 = ScaleGrad.apply(z1)
-            # z2 = ScaleGrad.apply(z2)
+            # p1 = ScaleGrad.apply(p1.double())
+            # p2 = ScaleGrad.apply(p2.double())
+            # z1 = ScaleGrad.apply(z1.double())
+            # z2 = ScaleGrad.apply(z2.double())
             losses[bn_dim] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
         return losses
     return compute_all_loss
@@ -517,6 +517,10 @@ class ScaleGrad(torch.autograd.Function):
         # x = (x ** 2).sum(dim=-1, keepdim=True)
         # return grad_output * torch.sqrt(x ** 3) / torch.sqrt(x.mean() ** 3)
         norm = torch.norm(x, p=2, dim=1, keepdim=True)
+        # print(grad_output.shape)
+        # print((x @ grad_output.T).sum(-1))
+        # for a, b in zip(x, grad_output):
+        #     print(torch.dot(a, b))
         return grad_output * norm / norm.mean()
 
 
