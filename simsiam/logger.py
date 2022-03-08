@@ -47,9 +47,26 @@ class TBLogger(SummaryWriter):
         for name, param in model.named_parameters():
 
             self.add_histogram(name, param.clone().cpu().data.numpy(), global_step=global_step)
+            self.add_scalar(f"model_describe/{name}_mean", param.clone().cpu().data.numpy().mean())
+            self.add_scalar(f"model_describe/{name}_std", param.clone().cpu().data.numpy().std())
             try:
                 self.add_histogram(name + "_grad", param.grad.clone().cpu().data.numpy(),
                                           global_step=global_step)
+                self.add_scalar(f"model_describe/{name}_grad_mean", param.grad.clone().cpu().data.numpy().mean())
+                self.add_scalar(f"model_describe/{name}_grad_std", param.grad.clone().cpu().data.numpy().std())
+            except (ValueError, AttributeError):
+                if not self.warned_missing_grad:
+                    warnings.warn(name + " has wrong gradient value")
+                    self.warned_missing_grad = True
+
+    def describe_model_step(self, params_before_step, params_after_step):
+        global_step = round(self.global_step / self.global_step_divider)
+        for (b_name, b_param), (name, param) in zip(params_before_step.items(), params_after_step.items()):
+            try:
+                self.add_histogram(name + "_step", (b_param - param),
+                                   global_step=global_step)
+                self.add_scalar(f"model_describe/{name}_step_mean", (b_param - param).mean())
+                self.add_scalar(f"model_describe/{name}_step_std", (b_param - param).std())
             except (ValueError, AttributeError):
                 if not self.warned_missing_grad:
                     warnings.warn(name + " has wrong gradient value")

@@ -7,6 +7,7 @@
 
 import argparse
 import builtins
+import copy
 import math
 import os
 import random
@@ -171,7 +172,7 @@ def main_worker(gpu, ngpus_per_node, args):
         models.__dict__[args.arch],
         args.dim, args.pred_dim)
 
-    multi_predictor = model.predictor
+    predictor = model.predictor
 
     # infer learning rate before changing batch size
     init_lr = args.lr * args.batch_size / 256
@@ -214,7 +215,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     if args.fix_pred_lr:
         optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
-                        {'params': model.module.double_predictor.parameters(), 'fix_lr': True}]
+                        {'params': model.module.predictor.parameters(), 'fix_lr': True}]
     else:
         optim_params = model.parameters()
 
@@ -292,7 +293,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # train for one epoch
         # with torch.autograd.set_detect_anomaly(True):
-        train(train_loader, model, multi_predictor, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args)
+        train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args)
 
         if (epoch + 1) % args.save_frequency == 0 or epoch == 0:
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed
@@ -350,7 +351,7 @@ def create_loss():
         return losses
     return compute_all_loss
 
-def train(train_loader, model, multi_predictor, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args):
+def train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args):
     log_per_step = 10000
     evaluate_per_epoch = 5
     main_rank = not args.multiprocessing_distributed or args.rank == 0
@@ -378,15 +379,6 @@ def train(train_loader, model, multi_predictor, criterion, optimizer, epoch, tb_
         # compute output and loss
         p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
         loss_dict = criterion(p1, p2, z1, z2)
-        if False:
-            for bn_dim, cossim in loss_dict.items():
-                new_p = None
-                if cossim <= 0.8:
-                    new_p = multi_predictor.decrease_dropout_p(bn_dim)
-                if cossim >= 0.85:
-                    new_p = multi_predictor.increase_dropout_p(bn_dim)
-                if main_rank and new_p is not None:
-                    tb_logger.add_scalar(tag=f"train/dropout_p_{bn_dim}", scalar_value=new_p)
 
         loss = .0
         for bn_dim, cossim in loss_dict.items():
@@ -395,6 +387,9 @@ def train(train_loader, model, multi_predictor, criterion, optimizer, epoch, tb_
                 tb_logger.add_scalar(tag=f"train/cossim_{bn_dim}", scalar_value=cossim.item())
         if main_rank and tb_logger.need_log(log_per_step):
             tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
+            tb_logger.describe_model(predictor)
+            predictor_prev_params = copy.deepcopy(
+                {n: p.detach().cpu().data.numpy() for n, p in predictor.named_parameters()})
             for bn_dim, cossim in loss_dict.items():
                 tb_logger.log_describe(f"stats/p_len_{bn_dim}", torch.cat([p1[bn_dim], p2[bn_dim]]).detach().norm(dim=-1))
                 tb_logger.log_describe(f"stats/z_len", torch.cat([z1, z2]).detach().norm(dim=-1))
@@ -405,6 +400,12 @@ def train(train_loader, model, multi_predictor, criterion, optimizer, epoch, tb_
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        if main_rank and tb_logger.need_log(log_per_step):
+            predictor_params = copy.deepcopy(
+                {n: p.detach().cpu().data.numpy() for n, p in predictor.named_parameters()})
+            tb_logger.describe_model_step(predictor_prev_params, predictor_params)
+            del predictor_params, predictor_prev_params
 
         # measure elapsed time
         batch_time.update(time.time() - end)
