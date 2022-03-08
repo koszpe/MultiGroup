@@ -188,7 +188,7 @@ class LinearPredictor(SimSiam):
         self.pred_type = pred_type
         del self.predictor
         self.predictor = nn.Sequential(nn.Linear(self.dim, self.pred_dim, bias=False),
-                                            nn.Linear(self.pred_dim, self.dim, bias=False))
+                                            nn.Linear(self.pred_dim, self.dim, bias=True))
         if pred_type == "predefined_linear":
             root_path = "/storage/simsiam/logs/original_nobnnorelupredhead_384bs_512/"
             epoch = "0050"
