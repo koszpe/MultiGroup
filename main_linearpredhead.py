@@ -95,7 +95,7 @@ parser.add_argument('--pred-dim', default=512, type=int,
 parser.add_argument('--no-fix-pred-lr', action='store_false', dest="fix_pred_lr",
                     help='Fix learning rate for the predictor')
 
-parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
+parser.add_argument('--logdir', default="/storage/simsiam/logs/linear", type=str,
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
