@@ -98,7 +98,8 @@ parser.add_argument('--logdir', default="/storage/simsiam/logs", type=str,
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
-parser.add_argument("--pred-type", default="linear", help="type of the prediction head", choices=["linear", "random_linear", "predefined_linear"])
+parser.add_argument("--pred-type", default="linear", help="type of the prediction head",
+                    choices=["linear", "random_linear", "predefined_linear", "low_rank_linear"])
 
 
 def main():
@@ -165,7 +166,7 @@ def main_worker(gpu, ngpus_per_node, args):
     #     models.__dict__[args.arch],
     #     args.dim, args.pred_dim)
 
-    model = simsiam.builder.PredefinedPredictor(
+    model = simsiam.builder.LinearPredictor(
         args.pred_type,
         models.__dict__[args.arch],
         args.dim, args.pred_dim)
