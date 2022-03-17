@@ -167,7 +167,7 @@ def main_worker(gpu, ngpus_per_node, args):
     #     models.__dict__[args.arch],
     #     args.dim, args.pred_dim)
 
-    model = simsiam.builder.LinearPredictor(
+    model = simsiam.builder.DifferentPredictor(
         args.pred_type,
         models.__dict__[args.arch],
         args.dim, args.pred_dim)
@@ -183,7 +183,6 @@ def main_worker(gpu, ngpus_per_node, args):
         # ourselves based on the total number of GPUs we have
         args.batch_size = int(args.batch_size / ngpus_per_node)
         args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-    evaluator = Evaluator(model.encoder, "imagenet", args.data, args.batch_size)
     if args.distributed:
         # Apply SyncBN
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -293,7 +292,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         # train for one epoch
         # with torch.autograd.set_detect_anomaly(True):
-        train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args)
+        train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger, eval_init_lr, args)
 
         if (epoch + 1) % args.save_frequency == 0 or epoch == 0:
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed
@@ -351,7 +350,7 @@ def create_loss():
         return losses
     return compute_all_loss
 
-def train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger, evaluator, eval_init_lr, args):
+def train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger, eval_init_lr, args):
     log_per_step = 10000
     evaluate_per_epoch = 5
     main_rank = not args.multiprocessing_distributed or args.rank == 0
@@ -413,7 +412,12 @@ def train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger
 
         # evaluate
         evaluate = tb_logger.need_log(evaluate_per_step) and tb_logger.global_step > 0
+        evaluate = True
         if evaluate:
+            encoder = model.module.encoder if type(model) is torch.nn.parallel.DistributedDataParallel else model.encoder
+            encoder = copy.deepcopy(encoder)
+            encoder.fc = nn.Identity()
+            evaluator = Evaluator(encoder, "imagenet", args.data, args.batch_size)
             embeddings = evaluator.generate_embeddings(n_views=1)
             accuracy = evaluator.linear_eval(*embeddings, epochs=100, batch_size=args.batch_size, lr=eval_init_lr)
             if main_rank:
