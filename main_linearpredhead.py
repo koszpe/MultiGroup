@@ -412,7 +412,6 @@ def train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger
 
         # evaluate
         evaluate = tb_logger.need_log(evaluate_per_step) and tb_logger.global_step > 0
-        evaluate = True
         if evaluate:
             encoder = model.module.encoder if type(model) is torch.nn.parallel.DistributedDataParallel else model.encoder
             encoder = copy.deepcopy(encoder)
