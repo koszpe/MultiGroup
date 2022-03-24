@@ -31,6 +31,9 @@ import torchvision.models as models
 import simsiam.loader
 import simsiam.builder
 from ssl_eval.eval import Evaluator
+
+from info_nce import InfoNCE
+from scale_grad import ScaleGrad
 from simsiam.logger import TBLogger
 
 model_names = sorted(name for name in models.__dict__
@@ -95,13 +98,18 @@ parser.add_argument('--pred-dim', default=512, type=int,
 parser.add_argument('--no-fix-pred-lr', action='store_false', dest="fix_pred_lr",
                     help='Fix learning rate for the predictor')
 
-parser.add_argument('--logdir', default="/storage/simsiam/logs/linear", type=str,
+parser.add_argument('--logdir', default="/storage/simsiam/logs/gradscale", type=str,
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
 parser.add_argument("--pred-type", default="linear", help="type of the prediction head",
-                    choices=["linear", "random_linear", "predefined_linear", "low_rank_linear"])
+                    choices=["linear", "random_linear", "predefined_linear", "low_rank_linear", "original"])
 
+parser.add_argument("--loss-type", default="cossim", help="type of loss",
+                    choices=["cossim", "infonce", "infonce_scalegrad", "cossim_scalegrad"])
+
+parser.add_argument('--fix-p-size', default=-1.0, type=float,
+                    help='if greater than 0, add loss term to fix p to this size')
 
 def main():
     args = parser.parse_args()
@@ -210,7 +218,7 @@ def main_worker(gpu, ngpus_per_node, args):
     print(model) # print model after SyncBatchNorm
 
     # define loss function (criterion) and optimizer
-    criterion = create_loss()
+    criterion = create_loss(args.loss_type, args.fix_p_size)
 
     if args.fix_pred_lr:
         optim_params = [{'params': model.module.encoder.parameters(), 'fix_lr': False},
@@ -336,19 +344,45 @@ def CosineSimilarity(inverse=False):
         return x1 @ x2.T
     return cosine_similarioty
 
-def create_loss():
+def create_loss(type="cossim", fix_p_size=-1):
     # cossim = CosineSimilarity(inverse=True)
-    cossim = torch.nn.CosineSimilarity(dim=1)
-    def compute_all_loss(p1s, p2s, z1, z2):
-        losses = dict()
-        for i, ((bn_dim, p1), p2) in enumerate(zip(p1s.items(), p2s.values())):
-            # p1 = ScaleGrad.apply(p1)
-            # p2 = ScaleGrad.apply(p2)
-            # z1 = ScaleGrad.apply(z1)
-            # z2 = ScaleGrad.apply(z2)
-            losses[bn_dim] = (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
-        return losses
-    return compute_all_loss
+    fix_p_term = lambda x: ((torch.norm(x, p=2, dim=-1) - fix_p_size) ** 2).mean() if fix_p_size > 0 else lambda x: 0.0
+    if "cossim" in type:
+        cossim = torch.nn.CosineSimilarity(dim=1)
+        def compute_all_loss(p1s, p2s, z1, z2):
+            losses = {"optim": dict(),
+                      "log": dict()}
+            for i, ((bn_dim, p1), p2) in enumerate(zip(p1s.items(), p2s.values())):
+                if "scalegrad" in type:
+                    p1 = ScaleGrad.apply(p1)
+                    p2 = ScaleGrad.apply(p2)
+                    z1 = ScaleGrad.apply(z1)
+                    z2 = ScaleGrad.apply(z2)
+                avg_cossim =  (cossim(p1, z2).mean() + cossim(p2, z1).mean()) * 0.5
+                avg_fix_p_term = (fix_p_term(p1) + fix_p_term(p2)) * 0.5
+                losses["optim"][bn_dim] = -avg_cossim + avg_fix_p_term
+                losses["log"][f"fix_p_term_{bn_dim}"] = avg_fix_p_term
+                losses["log"][f"cossim_{bn_dim}"] = avg_cossim
+            return losses
+        return compute_all_loss
+    elif "infonce" in type:
+        if "scalegrad" in type:
+            grad_scaling = True
+        else:
+            grad_scaling = False
+        info_nce =  InfoNCE(grad_scaling=grad_scaling)
+        def compute_all_loss(p1s, p2s, z1, z2):
+            losses = {"optim": dict(),
+                      "log": dict()}
+            for i, ((bn_dim, p1), p2) in enumerate(zip(p1s.items(), p2s.values())):
+                avg_info_nce = (info_nce(p1, z2).mean() + info_nce(p2, z1).mean()) * 0.5
+                avg_fix_p_term = (fix_p_term(p1) + fix_p_term(p2)) * 0.5
+                losses["optim"][bn_dim] = avg_info_nce + avg_fix_p_term
+                losses["log"][f"fix_p_term_{bn_dim}"] = avg_fix_p_term
+                losses["log"][f"info_nce_{bn_dim}"] = avg_info_nce
+            return losses
+
+        return compute_all_loss
 
 def train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger, eval_init_lr, args):
     log_per_step = 10000
@@ -380,18 +414,20 @@ def train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger
         loss_dict = criterion(p1, p2, z1, z2)
 
         loss = .0
-        for bn_dim, cossim in loss_dict.items():
-            loss -= cossim
+        for bn_dim, value in loss_dict["optim"].items():
+            loss += value
             if main_rank and tb_logger.need_log(log_per_step):
-                tb_logger.add_scalar(tag=f"train/cossim_{bn_dim}", scalar_value=cossim.item())
+                tb_logger.add_scalar(tag=f"train/loss_{bn_dim}", scalar_value=value.item())
         if main_rank and tb_logger.need_log(log_per_step):
             tb_logger.add_scalar(tag="train/loss", scalar_value=loss.item())
             tb_logger.describe_model(predictor)
             predictor_prev_params = copy.deepcopy(
                 {n: p.detach().cpu().data.numpy() for n, p in predictor.named_parameters()})
-            for bn_dim, cossim in loss_dict.items():
+            for bn_dim in loss_dict["optim"].keys():
                 tb_logger.log_describe(f"stats/p_len_{bn_dim}", torch.cat([p1[bn_dim], p2[bn_dim]]).detach().norm(dim=-1))
                 tb_logger.log_describe(f"stats/z_len", torch.cat([z1, z2]).detach().norm(dim=-1))
+            for key, value in loss_dict["log"].items():
+                tb_logger.add_scalar(tag=f"train/{key}", scalar_value=value.item())
 
         losses.update(loss.item(), images[0].size(0))
 
@@ -507,23 +543,6 @@ class InverseBackpropDivide(torch.autograd.Function):
     def backward(ctx, grad_output):
         numerator, denominator, = ctx.saved_tensors
         return grad_output / denominator, - grad_output * numerator / denominator ** 2
-
-class ScaleGrad(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        # norm = torch.norm(x, p=2, dim=1, keepdim=True)
-        ctx.save_for_backward(x)
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, = ctx.saved_tensors
-        # return grad_output * norm ** 2 / norm.mean() ** 2
-        # return grad_output * torch.sqrt(x ** 3) / torch.sqrt(x.mean() ** 3)
-        # x = (x ** 2).sum(dim=-1, keepdim=True)
-        # return grad_output * torch.sqrt(x ** 3) / torch.sqrt(x.mean() ** 3)
-        norm = torch.norm(x, p=2, dim=1, keepdim=True)
-        return grad_output * norm / norm.mean()
 
 
 if __name__ == '__main__':
