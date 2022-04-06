@@ -26,6 +26,8 @@ class InfoNCE(nn.Module):
 
     def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
 
+        run_type = ["label_smoothing", "top_k_based_on_cos_sim"][1]
+
         # Collect from all gpu
         z1 = AllGather.apply(z1)
         z2 = AllGather.apply(z2)
@@ -41,9 +43,19 @@ class InfoNCE(nn.Module):
         ones = torch.ones(n // 2).to(z.device)
         labels = ones.diagflat(n // 2) + ones.diagflat(-n // 2)
 
+        if run_type == "label_smoothing":
+            labels = labels.clamp(min=0.01)
+            labels = F.normalize(labels, dim=1)
+
         # Note: The following code might require a large amount of memory
         # in case of large batch size
         sim_m = z @ z.T
+        F.normalize(z, dim=1, p=2)
+        if run_type == "top_k_based_on_cos_sim":
+            cos_sim_m = F.softmax(z @ z.T, dim=1)
+            top_k, top_k_indices = torch.topk(cos_sim_m, k=10, dim=1)
+            top_sim = torch.zeros_like(cos_sim_m).scatter(dim=1, index=top_k_indices, src=top_k)
+            labels = torch.max(labels, top_sim)
 
         # This is a bit of cheat. Instead of removing cells from
         # the matrix where i==j, instead we set it to a very small value

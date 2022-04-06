@@ -41,7 +41,7 @@ model_names = sorted(name for name in models.__dict__
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument("--runname", default="dev", help="Name of run on tensorboard")
+parser.add_argument("--runname", default="top_10_based_on_cos_sim", help="Name of run on tensorboard")
 parser.add_argument('--data', metavar='DIR',
                     help='path to dataset', default='/shared_data/imagenet')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
@@ -102,10 +102,10 @@ parser.add_argument('--logdir', default="/storage/simsiam/logs/gradscale", type=
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
-parser.add_argument("--pred-type", default="linear", help="type of the prediction head",
+parser.add_argument("--pred-type", default="original", help="type of the prediction head",
                     choices=["linear", "random_linear", "predefined_linear", "low_rank_linear", "original"])
 
-parser.add_argument("--loss-type", default="cossim", help="type of loss",
+parser.add_argument("--loss-type", default="infonce", help="type of loss",
                     choices=["cossim", "infonce", "infonce_scalegrad", "cossim_scalegrad"])
 
 parser.add_argument('--fix-p-size', default=-1.0, type=float,
@@ -346,7 +346,9 @@ def CosineSimilarity(inverse=False):
 
 def create_loss(type="cossim", fix_p_size=-1):
     # cossim = CosineSimilarity(inverse=True)
-    fix_p_term = lambda x: ((torch.norm(x, p=2, dim=-1) - fix_p_size) ** 2).mean() if fix_p_size > 0 else lambda x: 0.0
+    fix_p_term = (lambda x: ((torch.norm(x, p=2, dim=-1) - fix_p_size) ** 2).mean()) if fix_p_size > 0 \
+        else lambda x: torch.Tensor([0.0]).to(device=x.device)
+
     if "cossim" in type:
         cossim = torch.nn.CosineSimilarity(dim=1)
         def compute_all_loss(p1s, p2s, z1, z2):
@@ -370,7 +372,7 @@ def create_loss(type="cossim", fix_p_size=-1):
             grad_scaling = True
         else:
             grad_scaling = False
-        info_nce =  InfoNCE(grad_scaling=grad_scaling)
+        info_nce = InfoNCE(grad_scaling=grad_scaling)
         def compute_all_loss(p1s, p2s, z1, z2):
             losses = {"optim": dict(),
                       "log": dict()}
