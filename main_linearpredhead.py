@@ -41,7 +41,7 @@ model_names = sorted(name for name in models.__dict__
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument("--runname", default="top_10_based_on_cos_sim", help="Name of run on tensorboard")
+parser.add_argument("--runname", default="top_10_based_on_cos_sim_substituted_with_075", help="Name of run on tensorboard")
 parser.add_argument('--data', metavar='DIR',
                     help='path to dataset', default='/shared_data/imagenet')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
