@@ -53,8 +53,17 @@ class InfoNCE(nn.Module):
         F.normalize(z, dim=1, p=2)
         if run_type == "top_k_based_on_cos_sim":
             cos_sim_m = F.softmax(z @ z.T, dim=1)
+            branch_mask_zeros = torch.zeros((int(cos_sim_m.shape[0]/2), int(cos_sim_m.shape[1]/2)))
+            branch_mask_ones = torch.ones((int(cos_sim_m.shape[0]/2), int(cos_sim_m.shape[1]/2)))
+            branch_mask = torch.cat(
+                [torch.cat([branch_mask_zeros, branch_mask_ones], dim=1),
+                torch.cat([branch_mask_ones, branch_mask_zeros], dim=1)],
+                dim=0
+            ).to(cos_sim_m.device)
+            cos_sim_m = torch.mul(branch_mask, cos_sim_m)
+
             top_k, top_k_indices = torch.topk(cos_sim_m, k=10, dim=1)
-            top_sim = torch.zeros_like(cos_sim_m).scatter(dim=1, index=top_k_indices, src=top_k)
+            top_sim = torch.zeros_like(cos_sim_m).scatter(dim=1, index=top_k_indices, src=torch.full_like(top_k, 0.75))
             labels = torch.max(labels, top_sim)
 
         # This is a bit of cheat. Instead of removing cells from
