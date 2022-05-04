@@ -41,7 +41,7 @@ model_names = sorted(name for name in models.__dict__
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument("--runname", default="top_10_based_on_cos_sim_substituted_with_075", help="Name of run on tensorboard")
+parser.add_argument("--runname", default="schedule_top_10_cos_sim_from30_through20", help="Name of run on tensorboard")
 parser.add_argument('--data', metavar='DIR',
                     help='path to dataset', default='/shared_data/imagenet')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
@@ -373,11 +373,11 @@ def create_loss(type="cossim", fix_p_size=-1):
         else:
             grad_scaling = False
         info_nce = InfoNCE(grad_scaling=grad_scaling)
-        def compute_all_loss(p1s, p2s, z1, z2):
+        def compute_all_loss(p1s, p2s, z1, z2, epoch):
             losses = {"optim": dict(),
                       "log": dict()}
             for i, ((bn_dim, p1), p2) in enumerate(zip(p1s.items(), p2s.values())):
-                avg_info_nce = (info_nce(p1, z2).mean() + info_nce(p2, z1).mean()) * 0.5
+                avg_info_nce = (info_nce(p1, z2, epoch).mean() + info_nce(p2, z1, epoch).mean()) * 0.5
                 avg_fix_p_term = (fix_p_term(p1) + fix_p_term(p2)) * 0.5
                 losses["optim"][bn_dim] = avg_info_nce + avg_fix_p_term
                 losses["log"][f"fix_p_term_{bn_dim}"] = avg_fix_p_term
@@ -413,7 +413,7 @@ def train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger
 
         # compute output and loss
         p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
-        loss_dict = criterion(p1, p2, z1, z2)
+        loss_dict = criterion(p1, p2, z1, z2, epoch=epoch)
 
         loss = .0
         for bn_dim, value in loss_dict["optim"].items():
