@@ -41,7 +41,7 @@ model_names = sorted(name for name in models.__dict__
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument("--runname", default="dev", help="Name of run on tensorboard")
+parser.add_argument("--runname", default="schedule_top_10_cos_sim_from30_through20", help="Name of run on tensorboard")
 parser.add_argument('--data', metavar='DIR',
                     help='path to dataset', default='/shared_data/imagenet')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
@@ -102,10 +102,10 @@ parser.add_argument('--logdir', default="/storage/simsiam/logs/gradscale", type=
                     help='Where to log')
 parser.add_argument("--save-frequency", default=5, help="Frequency of checkpoint saving in epochs")
 
-parser.add_argument("--pred-type", default="linear", help="type of the prediction head",
+parser.add_argument("--pred-type", default="original", help="type of the prediction head",
                     choices=["linear", "random_linear", "predefined_linear", "low_rank_linear", "original"])
 
-parser.add_argument("--loss-type", default="cossim", help="type of loss",
+parser.add_argument("--loss-type", default="infonce", help="type of loss",
                     choices=["cossim", "infonce", "infonce_scalegrad", "cossim_scalegrad"])
 
 parser.add_argument('--fix-p-size', default=-1.0, type=float,
@@ -346,7 +346,9 @@ def CosineSimilarity(inverse=False):
 
 def create_loss(type="cossim", fix_p_size=-1):
     # cossim = CosineSimilarity(inverse=True)
-    fix_p_term = lambda x: ((torch.norm(x, p=2, dim=-1) - fix_p_size) ** 2).mean() if fix_p_size > 0 else lambda x: 0.0
+    fix_p_term = (lambda x: ((torch.norm(x, p=2, dim=-1) - fix_p_size) ** 2).mean()) if fix_p_size > 0 \
+        else lambda x: torch.Tensor([0.0]).to(device=x.device)
+
     if "cossim" in type:
         cossim = torch.nn.CosineSimilarity(dim=1)
         def compute_all_loss(p1s, p2s, z1, z2):
@@ -370,12 +372,12 @@ def create_loss(type="cossim", fix_p_size=-1):
             grad_scaling = True
         else:
             grad_scaling = False
-        info_nce =  InfoNCE(grad_scaling=grad_scaling)
-        def compute_all_loss(p1s, p2s, z1, z2):
+        info_nce = InfoNCE(grad_scaling=grad_scaling)
+        def compute_all_loss(p1s, p2s, z1, z2, epoch):
             losses = {"optim": dict(),
                       "log": dict()}
             for i, ((bn_dim, p1), p2) in enumerate(zip(p1s.items(), p2s.values())):
-                avg_info_nce = (info_nce(p1, z2).mean() + info_nce(p2, z1).mean()) * 0.5
+                avg_info_nce = (info_nce(p1, z2, epoch).mean() + info_nce(p2, z1, epoch).mean()) * 0.5
                 avg_fix_p_term = (fix_p_term(p1) + fix_p_term(p2)) * 0.5
                 losses["optim"][bn_dim] = avg_info_nce + avg_fix_p_term
                 losses["log"][f"fix_p_term_{bn_dim}"] = avg_fix_p_term
@@ -411,7 +413,7 @@ def train(train_loader, model, predictor, criterion, optimizer, epoch, tb_logger
 
         # compute output and loss
         p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
-        loss_dict = criterion(p1, p2, z1, z2)
+        loss_dict = criterion(p1, p2, z1, z2, epoch=epoch)
 
         loss = .0
         for bn_dim, value in loss_dict["optim"].items():
