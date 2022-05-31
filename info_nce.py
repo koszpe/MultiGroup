@@ -4,6 +4,7 @@ from torch import nn
 
 from scale_grad import ScaleGrad
 from mp_utils import AllGather
+import copy
 
 __all__ = ['simclr_loss']
 
@@ -88,6 +89,10 @@ class InfoNCE(nn.Module):
                 labels = (1 - schedule[index_based_on_epoch]) * labels + schedule[index_based_on_epoch] * cos_sim_m
                 labels = F.softmax(labels, dim=1)
         elif run_type == "scheduled_top_k_cos_sim":
+            # hyper-parameters
+            num_of_top_k = 10  # 10
+            schedule_start_epoch = 30  # 30
+            schedule_length_epoch = 20
             # pairwise similarities between embeddings
             cos_sim_m = F.softmax(z @ z.T, dim=1)
             # masking  for ruling-out pairs from the same siamese branch
@@ -100,25 +105,28 @@ class InfoNCE(nn.Module):
             ).to(cos_sim_m.device)
             cos_sim_m = torch.mul(branch_mask, cos_sim_m)
             # selecting top-k similarities
-            top_k, top_k_indices = torch.topk(cos_sim_m, k=10, dim=1)
+            top_k, top_k_indices = torch.topk(cos_sim_m, k=num_of_top_k, dim=1)
             top_sim = torch.zeros_like(cos_sim_m).scatter(dim=1, index=top_k_indices, src=torch.full_like(top_k, 0.75))
             labels_based_on_similarity = torch.max(labels, top_sim)
             # scheduling
-            schedule_start_epoch = 30
-            schedule_length_epoch = 20
             if epoch >= schedule_start_epoch:
                 schedule = torch.linspace(start=0, end=1, steps=schedule_length_epoch)
                 index_based_on_epoch = min(epoch - schedule_start_epoch, schedule_length_epoch - 1)
                 labels = (1 - schedule[index_based_on_epoch]) * labels + schedule[index_based_on_epoch] * labels_based_on_similarity
-                labels = F.softmax(labels, dim=1)
-
+                labels = F.normalize(labels, dim=1)
 
         # This is a bit of cheat. Instead of removing cells from
         # the matrix where i==j, instead we set it to a very small value
         sim_m = sim_m.fill_diagonal_(-10) / self.tau
 
         # Get probability distribution
-        sim_m = torch.nn.functional.log_softmax(sim_m, dim=1)
+        sim_true_positive = sim_m.clone()
+        sim_auxiliary_positive = sim_m.clone()
+        true_positive_mask = torch.roll(torch.eye(sim_m.shape[0]), int(sim_m.shape[0]/2), dims=0).bool().cuda()
+        sim_auxiliary_positive.masked_fill_(true_positive_mask, (-10 / self.tau))
+        sim_true_positive = torch.nn.functional.log_softmax(sim_true_positive, dim=1)
+        sim_auxiliary_positive = torch.nn.functional.log_softmax(sim_auxiliary_positive, dim=1)
+        sim_m = torch.where(true_positive_mask.cuda(), sim_true_positive, sim_auxiliary_positive)
 
         # Choose values on which we calculate the loss
         loss = -torch.sum(sim_m * labels) / n
